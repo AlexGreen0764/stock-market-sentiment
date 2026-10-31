@@ -1,12 +1,12 @@
 {
-  "tickers": ["AAPL", "MSFT", "NVDA", "AMZN", "GOOG", "TSLA"],
   "start_date": "2009-01-01",
   "end_date": "2020-12-31",
   "output": "data/processed",
   "coverage": {
-    "covered_quarters": 24,
-    "covered_years": 8,
-    "median_articles_per_covered_quarter": 3,
-    "distinct_publication_dates": 60
+    "span_months": 24,
+    "covered_month_fraction": 0.75,
+    "max_empty_months": 3,
+    "distinct_publication_dates": 60,
+    "articles": 100
   }
 }
