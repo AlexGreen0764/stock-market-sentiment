@@ -31,7 +31,7 @@ Then run:
 python -m stock_market_sentiment
 ```
 
-Every ticker with a CSV file in `data/raw/full_history/` is evaluated; there is no configured ticker list. News identifiers are trimmed and uppercased and matched exactly to the price filenames (without `.csv`). Historical ticker aliases and multiple symbols in one field are not automatically resolved. The default article publication window is **January 1, 2009 through December 31, 2020**, inclusive. A prior data-quality review found article publisher and stock ticker fields more complete in this period; the later years should not be presented as equally complete without a fresh audit.
+Every ticker with a CSV file in `data/raw/full_history/` is evaluated; there is no configured ticker list. Both news identifiers and price filename stems are trimmed and uppercased for matching and output, while the original file paths are preserved for reading. For example, `nvda.csv` matches `NVDA` news. Multiple files resolving to the same normalized ticker cause an explicit error. Historical ticker aliases and multiple symbols in one field are not automatically resolved. The default article publication window is **January 1, 2009 through December 31, 2020**, inclusive. A prior data-quality review found article publisher and stock ticker fields more complete in this period; the later years should not be presented as equally complete without a fresh audit.
 
 The defaults come from `config/default.json`. CLI arguments override the file, for example:
 
@@ -54,6 +54,10 @@ Coverage is measured after article date checks, title checks, price matching, an
 Only tickers meeting all five rules appear in the news table. Valid price rows are retained regardless of news coverage. Each price row includes `news_coverage_pass`, `news_coverage_start`, and `news_coverage_end`; the bounds describe the first and last eligible article dates even if a ticker fails. Bounds are null when no eligible articles exist. Use the flag and bounds when comparing news and returns in Power BI; absence of recorded articles does not establish absence of news. If no ticker qualifies, the price table is still written and the news table is empty with its typed schema.
 
 The report separates price tickers from news-qualified (`retained_tickers`) and news-rejected tickers. It includes failed criteria, yearly eligible article counts, monthly coverage metrics, and per-ticker counts before and after publication-date filtering. `price_rows_valid` counts cleaned full-history input; `price_rows_kept` counts the actual exported price rows.
+
+`price_validation_by_ticker` breaks price rejections into parsing failures, nonfinite prices, nonpositive prices, invalid volumes, and inconsistent OHLC bounds. Each invalid row has one reason; duplicate dates are counted separately. `invalid_price_examples` contains at most three original rows per rejection reason across all tickers. Volumes such as `1604200.0` or `1.6042e6` are accepted when they represent exact nonnegative integers within the signed 64-bit range; fractional values are rejected rather than rounded.
+
+`retained_news_quality` reports missing publishers and URLs specifically in the final export, including the missing-publisher fraction (null if no news qualifies). `retained_news_by_year` reports article–ticker record counts and the number of qualifying tickers with articles each year. These counts are not unique articles across tickers. Coverage can vary substantially by year; compare activity within documented coverage periods instead of interpreting aggregate news growth as a consistent measure over time. Missing publishers remain flagged rather than causing otherwise usable records to be dropped.
 
 ## Output and calculations
 

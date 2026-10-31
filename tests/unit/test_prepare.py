@@ -4,6 +4,7 @@ import csv
 import json
 import tempfile
 import unittest
+from collections import Counter
 from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -13,6 +14,7 @@ from pyarrow import parquet
 from stock_market_sentiment.config import CoverageThresholds, load_config
 from stock_market_sentiment.prepare import (
     coverage_by_ticker,
+    load_prices,
     main,
     next_trading_day,
     prepare,
@@ -172,11 +174,11 @@ class PreparationTests(unittest.TestCase):
             root = Path(temp)
             folder = root / "data" / "raw" / "full_history"
             folder.mkdir(parents=True)
-            (folder / "NEW.csv").write_text(
+            (folder / "nEw.csv").write_text(
                 "date,open,high,low,close,adj close,volume\n"
                 "2020-12-30,10,11,9,10,10,100\n"
-                "2020-12-31,11,12,10,11,11,200\n"
-                "2021-01-04,12,13,11,12,12,300\n", encoding="utf-8",
+                "2020-12-31,11,12,10,11,11,200.0\n"
+                "2021-01-04,12,13,11,12,12,3e2\n", encoding="utf-8",
             )
             with (folder.parent / "nasdaq_exteral_data.csv").open("w", newline="", encoding="utf-8") as target:
                 writer = csv.writer(target)
@@ -194,13 +196,65 @@ class PreparationTests(unittest.TestCase):
             self.assertEqual(events[0]["next_trading_date"], date(2021, 1, 4))
             self.assertFalse(events[0]["has_url"])
             self.assertFalse(events[0]["has_publisher"])
+            self.assertEqual(report["candidate_tickers"], ["NEW"])
+            self.assertEqual(report["retained_tickers"], ["NEW"])
             self.assertEqual(report["counts"]["article_rows_duplicate"], 1)
             self.assertEqual(report["counts"]["article_rows_missing_title"], 1)
             self.assertEqual(report["counts"]["article_rows_unusable_price_match"], 1)
             self.assertEqual(report["counts"]["article_rows_unmatched_ticker"], 1)
             self.assertEqual(report["counts"]["price_rows_kept"], 3)
+            self.assertEqual(report["retained_news_quality"], {
+                "article_ticker_records": 1, "missing_publisher": 1,
+                "missing_publisher_fraction": 1, "missing_url": 1,
+            })
+            self.assertEqual(report["retained_news_by_year"], {2020: {
+                "article_ticker_records": 1, "tickers_with_articles": 1,
+            }})
+            self.assertEqual(report["price_validation_by_ticker"]["NEW"]["price_rows_invalid"], 0)
+            prices = parquet.read_table(output / "daily_prices.parquet").to_pylist()
+            self.assertEqual({row["ticker"] for row in prices}, {"NEW"})
+            self.assertEqual([row["volume"] for row in prices], [100, 200, 300])
             self.assertEqual(report["article_filter_counts_by_ticker"]["NEW"]["matched_articles"], 4)
             self.assertEqual(json.loads((root / "reports" / "quality_report.json").read_text())["retained_tickers"], ["NEW"])
+
+    def test_price_validation_accepts_integral_decimals_and_explains_rejections(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "mixed.csv"
+            cases = [
+                ("2020-01-01", "10", "11", "9", "100.0"),
+                ("2020-01-02", "10", "11", "9", "3e2"),
+                ("2020-01-03", "10", "11", "9", "1.5"),
+                ("2020-01-04", "10", "11", "9", "-1"),
+                ("2020-01-05", "10", "11", "9", "NaN"),
+                ("2020-01-06", "10", "11", "9", "Infinity"),
+                ("2020-01-07", "10", "11", "9", "9223372036854775808"),
+                ("2020-01-08", "NaN", "11", "9", "100"),
+                ("2020-01-09", "0", "11", "9", "100"),
+                ("2020-01-10", "10", "9", "9", "100"),
+                ("bad-date", "10", "11", "9", "100"),
+                ("2020-01-12", "10", "11", "9", "bad-volume"),
+                ("2020-01-13", "10", "11", "9", "9007199254740993.0"),
+            ]
+            with source.open("w", newline="", encoding="utf-8") as target:
+                writer = csv.writer(target)
+                writer.writerow(["date", "open", "high", "low", "close", "adj close", "volume"])
+                for day, opening, high, low, volume in cases:
+                    writer.writerow([day, opening, high, low, "10", "10", volume])
+            counts = Counter()
+            examples = {}
+            prices = load_prices(source, counts, examples)
+            self.assertEqual([row["volume"] for row in prices], [100, 300, 9007199254740993])
+            self.assertEqual({row["ticker"] for row in prices}, {"MIXED"})
+            self.assertEqual(counts["price_rows_read"], 13)
+            self.assertEqual(counts["price_rows_valid"], 3)
+            self.assertEqual(counts["price_rows_invalid"], 10)
+            self.assertEqual(counts["price_rows_invalid_volume"], 5)
+            self.assertEqual(counts["price_rows_invalid_parse"], 2)
+            self.assertEqual(counts["price_rows_invalid_nonfinite"], 1)
+            self.assertEqual(counts["price_rows_invalid_nonpositive_price"], 1)
+            self.assertEqual(counts["price_rows_invalid_ohlc_bounds"], 1)
+            self.assertEqual(len(examples["volume"]), 3)
+            self.assertEqual(examples["volume"][0]["source_file"], "mixed.csv")
 
     def test_invalid_monthly_thresholds_are_rejected(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -11,6 +11,7 @@ from bisect import bisect_right
 from collections import Counter, defaultdict, deque
 from dataclasses import asdict
 from datetime import date, datetime, timezone
+from decimal import Decimal, InvalidOperation
 from itertools import pairwise
 from pathlib import Path
 
@@ -20,6 +21,11 @@ from pyarrow import parquet
 from .config import CoverageThresholds, load_config
 
 PRICE_COLUMNS = ("date", "open", "high", "low", "close", "adj close", "volume")
+PRICE_COUNT_KEYS = (
+    "price_rows_read", "price_rows_valid", "price_rows_invalid", "price_rows_duplicate_date",
+    "price_rows_invalid_parse", "price_rows_invalid_nonfinite", "price_rows_invalid_nonpositive_price",
+    "price_rows_invalid_volume", "price_rows_invalid_ohlc_bounds",
+)
 PRICE_SCHEMA = pa.schema([
     ("ticker", pa.string()), ("date", pa.date32()),
     ("open", pa.float64()), ("high", pa.float64()), ("low", pa.float64()),
@@ -36,55 +42,63 @@ EVENT_SCHEMA = pa.schema([
 ])
 
 
-def load_prices(folder: Path, tickers: list[str], counts: Counter) -> dict[str, list[dict]]:
+def load_prices(source_path: Path, counts: Counter, invalid_examples: dict[str, list[dict]]) -> list[dict]:
     """Read per-ticker CSV files by header name and validate OHLCV rows."""
-    result = {}
-    for ticker in tickers:
-        source_path = folder / f"{ticker}.csv"
-        if not source_path.is_file():
-            raise FileNotFoundError(f"Missing price file: {source_path}")
-        by_date = {}
-        with source_path.open(encoding="utf-8-sig", newline="") as source:
-            reader = csv.DictReader(source)
-            if not set(PRICE_COLUMNS).issubset(reader.fieldnames or []):
-                raise ValueError(f"Unexpected price columns in {source_path}: {reader.fieldnames}")
-            for raw in reader:
-                counts["price_rows_read"] += 1
-                try:
-                    day = date.fromisoformat(raw["date"])
-                    values = {name: float(raw[name]) for name in PRICE_COLUMNS[1:-1]}
-                    volume = int(raw["volume"])
-                    if (not all(math.isfinite(value) for value in values.values()) or
-                            min(values.values()) <= 0 or volume < 0 or
-                            values["low"] > min(values["open"], values["close"], values["high"]) or
-                            values["high"] < max(values["open"], values["close"], values["low"])):
-                        raise ValueError("Invalid price or volume")
-                except (ValueError, TypeError, KeyError, OverflowError):
-                    counts["price_rows_invalid"] += 1
-                    continue
-                if day in by_date:
-                    counts["price_rows_duplicate_date"] += 1
-                    continue
-                by_date[day] = {
-                    "ticker": ticker, "date": day, "open": values["open"],
-                    "high": values["high"], "low": values["low"], "close": values["close"],
-                    "adj_close": values["adj close"], "volume": volume,
-                }
-        rows = [by_date[day] for day in sorted(by_date)]
-        previous_adjusted_close = None
-        previous_volumes = deque(maxlen=20)
-        for row in rows:
-            row["return_pct"] = (
-                round(100 * (row["adj_close"] / previous_adjusted_close - 1), 4)
-                if previous_adjusted_close is not None else None
-            )
-            average = sum(previous_volumes) / len(previous_volumes) if previous_volumes else 0
-            row["volume_vs_prior_20d"] = round(row["volume"] / average, 4) if average else None
-            previous_adjusted_close = row["adj_close"]
-            previous_volumes.append(row["volume"])
-        counts["price_rows_valid"] += len(rows)
-        result[ticker] = rows
-    return result
+    ticker = source_path.stem.strip().upper()
+    by_date = {}
+    with source_path.open(encoding="utf-8-sig", newline="") as source:
+        reader = csv.DictReader(source)
+        if not set(PRICE_COLUMNS).issubset(reader.fieldnames or []):
+            raise ValueError(f"Unexpected price columns in {source_path}: {reader.fieldnames}")
+        for raw in reader:
+            counts["price_rows_read"] += 1
+            reason = None
+            try:
+                day = date.fromisoformat(raw["date"])
+                values = {name: float(raw[name]) for name in PRICE_COLUMNS[1:-1]}
+                volume_value = Decimal(raw["volume"])
+            except (ValueError, TypeError, KeyError, OverflowError, InvalidOperation):
+                reason = "parse"
+            else:
+                if not all(math.isfinite(value) for value in values.values()):
+                    reason = "nonfinite"
+                elif min(values.values()) <= 0:
+                    reason = "nonpositive_price"
+                elif (not volume_value.is_finite() or volume_value < 0 or volume_value > 2**63 - 1
+                      or volume_value != volume_value.to_integral_value()):
+                    reason = "volume"
+                elif (values["low"] > min(values["open"], values["close"], values["high"])
+                      or values["high"] < max(values["open"], values["close"], values["low"])):
+                    reason = "ohlc_bounds"
+            if reason:
+                counts["price_rows_invalid"] += 1
+                counts[f"price_rows_invalid_{reason}"] += 1
+                examples = invalid_examples.setdefault(reason, [])
+                if len(examples) < 3:
+                    examples.append({"ticker": ticker, "source_file": source_path.name, "row": raw})
+                continue
+            if day in by_date:
+                counts["price_rows_duplicate_date"] += 1
+                continue
+            by_date[day] = {
+                "ticker": ticker, "date": day, "open": values["open"],
+                "high": values["high"], "low": values["low"], "close": values["close"],
+                "adj_close": values["adj close"], "volume": int(volume_value),
+            }
+    rows = [by_date[day] for day in sorted(by_date)]
+    previous_adjusted_close = None
+    previous_volumes = deque(maxlen=20)
+    for row in rows:
+        row["return_pct"] = (
+            round(100 * (row["adj_close"] / previous_adjusted_close - 1), 4)
+            if previous_adjusted_close is not None else None
+        )
+        average = sum(previous_volumes) / len(previous_volumes) if previous_volumes else 0
+        row["volume_vs_prior_20d"] = round(row["volume"] / average, 4) if average else None
+        previous_adjusted_close = row["adj_close"]
+        previous_volumes.append(row["volume"])
+    counts["price_rows_valid"] += len(rows)
+    return rows
 
 
 def next_trading_day(article_day: date, trading_days: list[date]) -> date | None:
@@ -209,7 +223,11 @@ def prepare(
         raise ValueError("start_date must be on or before end_date")
     coverage = coverage or CoverageThresholds()
     price_folder = root / "data" / "raw" / "full_history"
-    tickers = sorted(path.stem for path in price_folder.glob("*.csv"))
+    source_files = sorted(path for path in price_folder.glob("*.csv") if path.is_file())
+    price_files = {path.stem.strip().upper(): path for path in source_files}
+    if len(price_files) != len(source_files):
+        raise ValueError("Multiple price files resolve to the same normalized ticker")
+    tickers = sorted(price_files)
     if not tickers:
         raise ValueError(f"No price CSV files found in {price_folder}")
     counts = Counter()
@@ -220,6 +238,8 @@ def prepare(
     )
     coverage_summary = {}
     price_ranges = {}
+    price_validation = {}
+    invalid_price_examples = {}
     price_tickers = []
     output.mkdir(parents=True, exist_ok=True)
     price_path = output / "daily_prices.parquet.partial"
@@ -229,7 +249,10 @@ def prepare(
             news_path, EVENT_SCHEMA
         ) as news_writer:
             for ticker in tickers:
-                rows = load_prices(price_folder, [ticker], counts)[ticker]
+                price_counts = Counter()
+                rows = load_prices(price_files[ticker], price_counts, invalid_price_examples)
+                counts.update(price_counts)
+                price_validation[ticker] = {key: price_counts[key] for key in PRICE_COUNT_KEYS}
                 trading_days = [row["date"] for row in rows]
                 events = []
                 seen = set()
@@ -252,6 +275,8 @@ def prepare(
                 if metrics["passes"]:
                     news_writer.write_table(pa.Table.from_pylist(events, schema=EVENT_SCHEMA))
                     counts["article_rows_kept"] += len(events)
+                    counts["article_rows_kept_missing_publisher"] += sum(not event["has_publisher"] for event in events)
+                    counts["article_rows_kept_missing_url"] += sum(not event["has_url"] for event in events)
                     linked_sessions = {event["next_trading_date"] for event in events}
                 selected_rows = [
                     row for row in rows
@@ -280,6 +305,11 @@ def prepare(
         news_path.unlink(missing_ok=True)
 
     retained_tickers = [ticker for ticker in tickers if coverage_summary[ticker]["passes"]]
+    retained_articles_by_year = Counter()
+    retained_tickers_by_year = Counter()
+    for ticker in retained_tickers:
+        retained_articles_by_year.update(coverage_summary[ticker]["articles_by_year"])
+        retained_tickers_by_year.update(coverage_summary[ticker]["articles_by_year"].keys())
     report = {
         "candidate_tickers": tickers,
         "price_tickers": price_tickers,
@@ -288,12 +318,28 @@ def prepare(
         "coverage_thresholds": asdict(coverage),
         "coverage_by_ticker": coverage_summary,
         "article_filter_counts_by_ticker": {ticker: dict(ticker_counts[ticker]) for ticker in tickers},
+        "price_validation_by_ticker": price_validation,
+        "invalid_price_examples": invalid_price_examples,
+        "retained_news_quality": {
+            "article_ticker_records": counts["article_rows_kept"],
+            "missing_publisher": counts["article_rows_kept_missing_publisher"],
+            "missing_publisher_fraction": (
+                counts["article_rows_kept_missing_publisher"] / counts["article_rows_kept"]
+                if counts["article_rows_kept"] else None
+            ),
+            "missing_url": counts["article_rows_kept_missing_url"],
+        },
+        "retained_news_by_year": {
+            year: {"article_ticker_records": total, "tickers_with_articles": retained_tickers_by_year[year]}
+            for year, total in sorted(retained_articles_by_year.items())
+        },
         "counts": {key: counts[key] for key in (
-            "price_rows_read", "price_rows_invalid", "price_rows_duplicate_date", "price_rows_valid", "price_rows_kept",
+            *PRICE_COUNT_KEYS, "price_rows_kept",
             "article_rows_read", "article_rows_selected", "article_rows_unmatched_ticker", "article_rows_invalid_date",
             "article_rows_missing_title", "article_rows_missing_url", "article_rows_missing_publisher", "article_rows_duplicate",
             "article_rows_unusable_price_match", "article_rows_outside_date_range",
             "article_rows_before_coverage", "article_rows_kept",
+            "article_rows_kept_missing_publisher", "article_rows_kept_missing_url",
         )},
         "start_date": start_date.isoformat() if start_date else None,
         "end_date": end_date.isoformat() if end_date else None,
