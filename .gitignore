@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+data/processed/
+reports/quality_report.json
+nasdaq_exteral_data.csv
+full_history/
