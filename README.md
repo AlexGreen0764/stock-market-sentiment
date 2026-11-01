@@ -19,7 +19,7 @@ The two raw input collections are excluded from Git because the article export a
 
 ## Run
 
-Requires Python 3.10 or newer and PyArrow. From the repository root, install the package and its dependency in editable mode once:
+Requires Python 3.10 or newer, PyArrow, PyTorch, and Transformers. From the repository root, install the package and its dependencies in editable mode once:
 
 ```powershell
 python -m pip install -e .
@@ -40,6 +40,40 @@ python -m stock_market_sentiment --start-date 2018-01-01 --end-date 2020-12-31
 ```
 
 Each run writes exactly two Parquet tables. The pipeline scans the complete article file once, retaining matching in-window article metadata in memory but discarding article bodies. It then processes and writes one ticker's prices at a time, calculating returns and volume history before applying the requested date range. A full run can take time and requires memory for the matching article metadata. Use `python -m unittest discover -s tests` to run the focused tests with temporary fixtures.
+
+## Score news sentiment
+
+After preparation, run the separate sentiment stage. It reads the existing news Parquet file, so there is no need to rescan the raw article export:
+
+```powershell
+python -m stock_market_sentiment.sentiment
+```
+
+This uses [AnkitAI/FinSense-ModernBERT-Financial-News-Sentiment-Analysis](https://huggingface.co/AnkitAI/FinSense-ModernBERT-Financial-News-Sentiment-Analysis) locally. The first scoring run downloads its tokenizer and model weights from Hugging Face. It scores the `title` column, not article bodies, because the model is designed for financial sentences and headlines and the prepared data retains titles. Input is truncated to 128 tokens, matching the training length described in the model card.
+
+The defaults target an i5-13600KF, RTX 5070 (12 GB), and 32 GB RAM: CUDA inference with BF16 weights, SDPA attention, a batch size of 128, six PyTorch CPU threads, and 8,192-record Parquet chunks. Batch size 128 was fastest in a small synthetic GPU benchmark (about 3,267 headline inferences/second versus 2,120 at batch size 32); this is not a full-dataset speed estimate. Install the CUDA build in your project environment before running:
+
+```powershell
+python -m pip install --upgrade torch torchvision --index-url https://download.pytorch.org/whl/cu134
+python -m stock_market_sentiment.sentiment
+```
+
+The scorer runs on CUDA only and uses fixed settings in `sentiment.py`; there are no command-line tuning parameters. It reads `data/processed/news_events.parquet` and writes `reports/sentiment_report.json`. The model and tokenizer both use the pinned commit `fa8b21b6b6549ca70263ee96b9ec52aba67cd2b4`, without an extra API call to resolve a revision. CUDA availability and the model's expected label mapping are checked before scoring.
+
+The stage streams Parquet chunks and performs batched inference, preserving every existing row, column, and date type. Within each chunk, exact duplicate titles are scored once, tokenization runs once on all unique titles, and inputs are grouped by token length to minimize padding. On a 1,024-headline sample, length grouping reduced median inference time from 0.672 to 0.262 seconds; pinned transfers gave no improvement and were removed. Class probabilities are calculated in FP32 and copied to CPU once per chunk. Predictions are restored to their original row order. Memory use is bounded by a chunk rather than the full dataset. The tokenizer uses six Rayon threads unless `RAYON_NUM_THREADS` is explicitly set.
+
+The stage writes a temporary Parquet file, then replaces `news_events.parquet` after all records score successfully. A failed inference leaves the original file intact. Rerunning replaces existing sentiment columns without duplicating them. Repeating preparation recreates the unscored news file, so run sentiment scoring after your final preparation run. Progress includes records per second and an estimated remaining time; estimates exclude model loading and can change with headline lengths.
+
+| Added field | Meaning |
+| --- | --- |
+| `sentiment_score` | `P(positive) - P(negative)`, from -1 to +1 |
+| `sentiment_label` | Most probable class: negative, neutral, or positive |
+| `sentiment_confidence` | Probability of the most probable class |
+| `sentiment_negative`, `sentiment_neutral`, `sentiment_positive` | All three class probabilities |
+
+Scores and probabilities are numeric float32 columns for Power BI. Confidence is a model probability, not a calibrated accuracy estimate or a stock-return prediction. A headline's overall tone is assigned to its article–ticker records; it is not a separate sentiment judgment about each company mentioned. The source has no sentiment labels against which to measure accuracy, so review a sample of your own headlines before interpreting the outputs.
+
+`reports/sentiment_report.json` records the pinned model commit, input column, truncation length, record count, class distribution, mean score, throughput, and elapsed time. `headline_inferences` counts unique titles per chunk (not globally unique articles). Model provenance is also stored in the Parquet schema metadata. This audit is separate from `quality_report.json`, which continues to describe preparation. The two visualization files remain the price table and the enriched news table.
 
 ## Ticker coverage filter
 

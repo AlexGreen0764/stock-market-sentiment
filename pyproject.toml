@@ -7,7 +7,7 @@ name = "stock-market-sentiment-prep"
 version = "0.1.0"
 description = "Prepare stock prices and news for visualization"
 requires-python = ">=3.10"
-dependencies = ["pyarrow>=16"]
+dependencies = ["pyarrow>=16", "torch>=2.5", "transformers>=5.14.1,<6"]
 
 [tool.setuptools.packages.find]
 include = ["stock_market_sentiment*"]

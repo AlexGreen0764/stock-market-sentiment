@@ -5,5 +5,6 @@ __pycache__/
 *.egg-info/
 data/processed/
 reports/quality_report.json
+reports/sentiment_report.json
 nasdaq_exteral_data.csv
 full_history/
