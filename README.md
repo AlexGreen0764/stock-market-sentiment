@@ -22,7 +22,7 @@ The two raw input collections are excluded from Git because the article export a
 
 ## Requirements and installation
 
-The package declares Python 3.10 or newer. The current CUDA 13.4 installation below uses PyTorch and Transformers releases requiring **Python 3.11 or newer**; Python 3.13 has been used for validation. Dependencies are declared in [pyproject.toml](./pyproject.toml).
+Requires **Python 3.11 or newer**, matching the current PyTorch and Transformers dependencies. Python 3.13 has been used for validation. Dependencies are declared in [pyproject.toml](./pyproject.toml).
 
 - Preparation uses PyArrow and does not require a GPU.
 - Sentiment scoring requires an **NVIDIA GPU supporting CUDA and BF16**, a compatible NVIDIA driver, and a CUDA-enabled PyTorch installation. There is no CPU scoring mode.

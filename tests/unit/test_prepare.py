@@ -5,7 +5,7 @@ import json
 import tempfile
 import unittest
 from collections import Counter
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -132,7 +132,7 @@ class PreparationTests(unittest.TestCase):
             self.assertEqual(events[0]["title"], "Good, news")
             self.assertEqual(
                 news.column("published_at_utc").cast("int64")[0].as_py(),
-                int(datetime(2023, 12, 22, 14, tzinfo=timezone.utc).timestamp() * 1000),
+                int(datetime(2023, 12, 22, 14, tzinfo=UTC).timestamp() * 1000),
             )
             self.assertEqual(events[0]["article_date_utc"], date(2023, 12, 22))
             self.assertEqual(events[0]["next_trading_date"], date(2023, 12, 26))

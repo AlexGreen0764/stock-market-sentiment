@@ -2,7 +2,7 @@
 
 import tempfile
 import unittest
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -29,7 +29,7 @@ def write_fixture(path: Path, titles: list[str]) -> None:
     """Write typed news rows whose stable identities expose ordering regressions."""
     rows = [{
         "ticker": "ABC", "title": title,
-        "published_at_utc": datetime(2020, 12, 31, 14, tzinfo=timezone.utc),
+        "published_at_utc": datetime(2020, 12, 31, 14, tzinfo=UTC),
         "article_date_utc": date(2020, 12, 31), "next_trading_date": date(2021, 1, 4),
         "url": f"https://example.test/{index}", "publisher": "Test",
         "has_url": True, "has_publisher": True,

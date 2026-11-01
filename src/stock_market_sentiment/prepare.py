@@ -15,7 +15,7 @@ import os
 from bisect import bisect_right
 from collections import Counter, defaultdict, deque
 from dataclasses import asdict
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from itertools import pairwise
 from pathlib import Path
@@ -239,7 +239,7 @@ def load_articles(
             ticker_counts[ticker]["matched_articles"] += 1
             published = (raw.get("Date") or "").strip()
             try:
-                published_at = datetime.strptime(published, "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=timezone.utc)
+                published_at = datetime.strptime(published, "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=UTC)
                 article_day = published_at.date()
             except ValueError:
                 counts["article_rows_invalid_date"] += 1
