@@ -44,7 +44,7 @@ def summarize_probabilities(probabilities: list[float]) -> dict:
 
 
 class FinSenseScorer:
-    """Load the pinned FinSense model for BF16 inference on the RTX 5070."""
+    """Load the pinned FinSense model for CUDA/BF16 headline inference."""
 
     def __init__(self):
         os.environ.setdefault("RAYON_NUM_THREADS", str(CPU_THREADS))

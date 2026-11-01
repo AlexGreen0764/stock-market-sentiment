@@ -1,1 +1,1 @@
-"""Data preparation for stock market and news visualizations."""
+"""Stock price preparation and financial headline sentiment for Power BI."""

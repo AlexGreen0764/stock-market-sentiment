@@ -5,7 +5,8 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "stock-market-sentiment-prep"
 version = "0.1.0"
-description = "Prepare stock prices and news for visualization"
+description = "Prepare stock prices, news, and FinSense headline sentiment for Power BI"
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["pyarrow>=16", "torch>=2.5", "transformers>=5.14.1,<6"]
 

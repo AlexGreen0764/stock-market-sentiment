@@ -1,66 +1,85 @@
 # Stock market data preparation
 
-This repository prepares the supplied stock price and Nasdaq article files for a visualization project about price trends, trading volume, and the association between news and subsequent price moves. It produces data tables and a quality report; it does not make trading recommendations or claim that articles cause price changes.
+This Python project prepares stock prices and financial news, then adds FinSense headline sentiment for Power BI visualizations of price trends, trading volume, and associations between news and subsequent price moves. It produces two Parquet tables and separate preparation and sentiment reports. Sentiment is a model estimate of headline tone, not a prediction of stock returns or evidence that news caused a price move.
 
 ## Repository layout
 
 | Path | Purpose |
 | --- | --- |
-| `src/stock_market_sentiment/` | Python data preparation package and command line entry point |
-| `tests/unit/` | Focused parser, cleaning, and date alignment checks |
+| `src/stock_market_sentiment/prepare.py` | Price/news cleaning, coverage filtering, and trading-date matching |
+| `src/stock_market_sentiment/sentiment.py` | Separate CUDA headline-scoring stage |
+| `src/stock_market_sentiment/config.py` | Preparation configuration loading and validation |
+| `tests/unit/` | Preparation, sentiment calculation, row preservation, and failure checks |
 | `data/raw/full_history/` | Supplied per-symbol daily OHLCV CSV files (local input) |
 | `data/raw/nasdaq_exteral_data.csv` | Supplied Nasdaq article export (local input; filename retained as received) |
 | `data/processed/` | Two generated visualization tables |
 | `reports/quality_report.json` | Generated coverage and data-quality audit |
+| `reports/sentiment_report.json` | Generated sentiment scoring audit |
 | `config/default.json` | Date range, output directory, and news coverage thresholds |
 | `Final Project_SP.pdf` | Supplied course project brief |
 
 The two raw input collections are excluded from Git because the article export alone is about 23 GB. Preserve them locally. The origin and licensing of the historical price files and the article export still need to be confirmed by the data provider; article URLs point to individual Nasdaq pages but do not establish how the bulk file was collected.
 
-## Run
+## Requirements and installation
 
-Requires Python 3.10 or newer, PyArrow, PyTorch, and Transformers. From the repository root, install the package and its dependencies in editable mode once:
+The package declares Python 3.10 or newer. The current CUDA 13.4 installation below uses PyTorch and Transformers releases requiring **Python 3.11 or newer**; Python 3.13 has been used for validation. Dependencies are declared in [pyproject.toml](./pyproject.toml).
+
+- Preparation uses PyArrow and does not require a GPU.
+- Sentiment scoring requires an **NVIDIA GPU supporting CUDA and BF16**, a compatible NVIDIA driver, and a CUDA-enabled PyTorch installation. There is no CPU scoring mode.
+- Internet access is needed to download dependencies and, on first use, the pinned model and tokenizer. Model inference runs locally.
+- Preparation retains matching article metadata in system memory; sentiment scoring processes bounded chunks. Exact memory requirements depend on the input data.
+
+From the repository root, create an environment and install the CUDA build before installing the project. PowerShell example:
 
 ```powershell
-python -m pip install -e .
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade torch torchvision --index-url https://download.pytorch.org/whl/cu134
+.\.venv\Scripts\python.exe -m pip install -e .
 ```
 
-Then run:
+The CUDA wheel includes the runtime used by PyTorch; a separate CUDA Toolkit installation is not required for this pipeline. A CPU-only PyTorch package cannot run the sentiment stage.
+
+## 1. Prepare prices and news
+
+Place the raw inputs in the locations above, review [config/default.json](./config/default.json), then run:
 
 ```powershell
-python -m stock_market_sentiment
+.\.venv\Scripts\python.exe -m stock_market_sentiment
 ```
 
 Every ticker with a CSV file in `data/raw/full_history/` is evaluated; there is no configured ticker list. Both news identifiers and price filename stems are trimmed and uppercased for matching and output, while the original file paths are preserved for reading. For example, `nvda.csv` matches `NVDA` news. Multiple files resolving to the same normalized ticker cause an explicit error. Historical ticker aliases and multiple symbols in one field are not automatically resolved. The default article publication window is **January 1, 2009 through December 31, 2020**, inclusive. A prior data-quality review found article publisher and stock ticker fields more complete in this period; the later years should not be presented as equally complete without a fresh audit.
 
-The defaults come from `config/default.json`. CLI arguments override the file, for example:
+The preparation configuration contains only:
+
+| Setting | Purpose |
+| --- | --- |
+| `start_date`, `end_date` | Inclusive article publication and base price-export window |
+| `output` | Preparation output directory, relative to the repository root unless absolute |
+| `coverage` | The five news qualification thresholds described below |
+
+Preparation accepts `--root`, `--config`, `--output`, `--start-date`, and `--end-date`. CLI arguments override the file, for example:
 
 ```powershell
-python -m stock_market_sentiment --start-date 2018-01-01 --end-date 2020-12-31
+.\.venv\Scripts\python.exe -m stock_market_sentiment --start-date 2018-01-01 --end-date 2020-12-31
 ```
 
-Each run writes exactly two Parquet tables. The pipeline scans the complete article file once, retaining matching in-window article metadata in memory but discarding article bodies. It then processes and writes one ticker's prices at a time, calculating returns and volume history before applying the requested date range. A full run can take time and requires memory for the matching article metadata. Use `python -m unittest discover -s tests` to run the focused tests with temporary fixtures.
+There is no ticker list or output-format setting. Each run writes exactly two Parquet tables. The pipeline scans the complete article file once, retaining matching in-window article metadata in memory but discarding article bodies. It then processes and writes one ticker's prices at a time, calculating returns and volume history before applying the requested date range. The preparation report is written to `reports/quality_report.json`. A full run can take time.
 
-## Score news sentiment
+## 2. Score news sentiment
 
 After preparation, run the separate sentiment stage. It reads the existing news Parquet file, so there is no need to rescan the raw article export:
 
 ```powershell
-python -m stock_market_sentiment.sentiment
+.\.venv\Scripts\python.exe -m stock_market_sentiment.sentiment
 ```
 
 This uses [AnkitAI/FinSense-ModernBERT-Financial-News-Sentiment-Analysis](https://huggingface.co/AnkitAI/FinSense-ModernBERT-Financial-News-Sentiment-Analysis) locally. The first scoring run downloads its tokenizer and model weights from Hugging Face. It scores the `title` column, not article bodies, because the model is designed for financial sentences and headlines and the prepared data retains titles. Input is truncated to 128 tokens, matching the training length described in the model card.
 
-The defaults target an i5-13600KF, RTX 5070 (12 GB), and 32 GB RAM: CUDA inference with BF16 weights, SDPA attention, a batch size of 128, six PyTorch CPU threads, and 8,192-record Parquet chunks. Batch size 128 was fastest in a small synthetic GPU benchmark (about 3,267 headline inferences/second versus 2,120 at batch size 32); this is not a full-dataset speed estimate. Install the CUDA build in your project environment before running:
+The scorer uses fixed settings in [sentiment.py](./src/stock_market_sentiment/sentiment.py): CUDA/BF16 inference, SDPA attention, 128-headline model batches, 128-token truncation, and 8,192-record Parquet chunks. It has no command-line tuning parameters and does not read `config/default.json`. It reads `data/processed/news_events.parquet` and writes `reports/sentiment_report.json`. Use the default preparation output directory for this two-stage workflow; a custom preparation `output` is not automatically picked up by scoring.
 
-```powershell
-python -m pip install --upgrade torch torchvision --index-url https://download.pytorch.org/whl/cu134
-python -m stock_market_sentiment.sentiment
-```
+The model and tokenizer both use the pinned commit `fa8b21b6b6549ca70263ee96b9ec52aba67cd2b4`. CUDA availability and the model's expected label mapping are checked before scoring. An empty news file stops scoring before the model loads.
 
-The scorer runs on CUDA only and uses fixed settings in `sentiment.py`; there are no command-line tuning parameters. It reads `data/processed/news_events.parquet` and writes `reports/sentiment_report.json`. The model and tokenizer both use the pinned commit `fa8b21b6b6549ca70263ee96b9ec52aba67cd2b4`, without an extra API call to resolve a revision. CUDA availability and the model's expected label mapping are checked before scoring.
-
-The stage streams Parquet chunks and performs batched inference, preserving every existing row, column, and date type. Within each chunk, exact duplicate titles are scored once, tokenization runs once on all unique titles, and inputs are grouped by token length to minimize padding. On a 1,024-headline sample, length grouping reduced median inference time from 0.672 to 0.262 seconds; pinned transfers gave no improvement and were removed. Class probabilities are calculated in FP32 and copied to CPU once per chunk. Predictions are restored to their original row order. Memory use is bounded by a chunk rather than the full dataset. The tokenizer uses six Rayon threads unless `RAYON_NUM_THREADS` is explicitly set.
+The stage streams Parquet chunks and performs batched inference, preserving every existing row, column, and date type. Within each chunk, exact duplicate titles are scored once, tokenization runs once on all unique titles, and inputs are grouped by token length to minimize padding. Class probabilities are calculated in FP32 and copied to CPU once per chunk. Predictions are restored to their original row order. Memory use is bounded by a chunk rather than the full dataset.
 
 The stage writes a temporary Parquet file, then replaces `news_events.parquet` after all records score successfully. A failed inference leaves the original file intact. Rerunning replaces existing sentiment columns without duplicating them. Repeating preparation recreates the unscored news file, so run sentiment scoring after your final preparation run. Progress includes records per second and an estimated remaining time; estimates exclude model loading and can change with headline lengths.
 
@@ -98,7 +117,7 @@ The report separates price tickers from news-qualified (`retained_tickers`) and 
 | File | Grain and key | Main fields |
 | --- | --- | --- |
 | `daily_prices.parquet` | One row per price-file ticker and valid trading date in the window, plus sessions linked by retained news | OHLC, adjusted close, shares traded, adjusted-close return %, volume / mean of up to 20 prior sessions, news coverage flag and bounds |
-| `news_events.parquet` | One row per deduplicated article and news-qualified ticker | `published_at_utc`, `article_date_utc`, `next_trading_date`, title, URL, publisher, `has_url`, `has_publisher` |
+| `news_events.parquet` | One row per deduplicated article and news-qualified ticker | Publication timestamp/date, next trading date, title, URL, publisher, completeness flags, and the six sentiment fields after scoring |
 
 The `date`, `article_date_utc`, and `next_trading_date` columns are stored as dates; `published_at_utc` is stored as a UTC timestamp. Price and volume fields have numeric types. This makes the files ready for Power BI date relationships without parsing date text. `reports/quality_report.json` records input, rejected, and retained row counts plus ticker coverage; it is not a third visualization table.
 
@@ -107,3 +126,13 @@ Returns use adjacent available trading sessions: `100 × (adjusted close / previ
 Each article retains its original UTC publication date in `article_date_utc` and receives a separate `next_trading_date`: the first date strictly after publication that appears in that ticker's price history. This skips weekends and market holidays represented by gaps in the price history. Articles before the first price date, without a later session, or with a gap longer than **7 calendar days** are excluded. This gap limit is a data-quality guard, not an exchange holiday calendar. Articles with empty titles are excluded; missing URLs and publishers are flagged and retained. Articles without URLs are deduplicated by publication timestamp and title within each ticker.
 
 Only publication dates must fall in the selected window. A retained late-2020 article can link to an early-2021 session, and that session is included in the price output. The rule excludes same-day reactions and can group several articles on one trading day. Comparing linked news with `return_pct` shows association only: market-wide events, other news, and stock-specific fundamentals also affect prices.
+
+## Validation
+
+Run the unit tests from the repository root:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+The tests use temporary fixtures and mocked model predictions; they do not process the raw dataset, download model weights, or require a GPU. They verify cleaning, monthly coverage, ticker normalization, trading-date links, sentiment arithmetic, row/date preservation, reruns, and preservation of the original file after an inference failure.
