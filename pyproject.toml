@@ -8,6 +8,8 @@ version = "0.1.0"
 description = "Prepare stock prices, news, and FinSense headline sentiment for Power BI"
 readme = "README.md"
 requires-python = ">=3.10"
+# Install the CUDA-enabled torch wheel using the README command; dependency
+# metadata alone cannot select a platform-specific PyTorch wheel index.
 dependencies = ["pyarrow>=16", "torch>=2.5", "transformers>=5.14.1,<6"]
 
 [tool.setuptools.packages.find]

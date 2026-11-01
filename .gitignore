@@ -1,8 +1,10 @@
+# Local environments and generated Python/build metadata.
 .venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 *.egg-info/
+# Large source data and reproducible pipeline outputs stay local.
 data/processed/
 reports/quality_report.json
 reports/sentiment_report.json

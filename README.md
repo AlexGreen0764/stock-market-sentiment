@@ -94,6 +94,20 @@ Scores and probabilities are numeric float32 columns for Power BI. Confidence is
 
 `reports/sentiment_report.json` records the pinned model commit, input column, truncation length, record count, class distribution, mean score, throughput, and elapsed time. `headline_inferences` counts unique titles per chunk (not globally unique articles). Model provenance is also stored in the Parquet schema metadata. This audit is separate from `quality_report.json`, which continues to describe preparation. The two visualization files remain the price table and the enriched news table.
 
+Report files and configuration are standard JSON and cannot contain comments. Field definitions belong here; generated reports should not be edited manually.
+
+| Sentiment report field | Interpretation |
+| --- | --- |
+| `model`, `model_revision` | Model identifier and pinned weights/tokenizer commit |
+| `input_file`, `input_column`, `max_tokens` | Scored file, headline field, and truncation limit |
+| `batch_size`, `read_batch_size` | Headlines per model batch and records per Parquet chunk |
+| `rows_scored` | Exported article-ticker records, including repeated headlines |
+| `headline_inferences` | Sum of distinct titles scored per chunk; titles may recur in later chunks |
+| `label_counts` | Winning-label counts across exported records; their sum equals `rows_scored` |
+| `mean_sentiment_score` | Mean signed score across records, weighted by article-ticker associations |
+| `records_per_second` | Processing throughput including I/O, excluding initial model loading |
+| `elapsed_seconds` | Elapsed wall time up to report assembly, including model loading |
+
 ## Ticker coverage filter
 
 Coverage is measured after article date checks, title checks, price matching, and duplicate removal. A covered month contains at least one eligible article. The span includes every calendar month from the first eligible article month through the last, counting both endpoints and all empty months. These are practical starting thresholds for visualization, not statistical guarantees. Defaults in `config/default.json` require:

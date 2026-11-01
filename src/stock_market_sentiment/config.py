@@ -1,4 +1,8 @@
-"""Configuration loading for the stock-market preparation pipeline."""
+"""Load and validate preparation settings from JSON and CLI overrides.
+
+Sentiment inference uses fixed settings in its own module; these settings only
+control preparation. Configuration files remain standard, comment-free JSON.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +15,12 @@ from typing import Any
 
 @dataclass(frozen=True)
 class CoverageThresholds:
-    """Minimum news coverage within a ticker's first-to-last article months."""
+    """News qualification limits within the first-to-last eligible article span.
+
+    ``covered_month_fraction`` includes empty months in its denominator.
+    ``max_empty_months`` is an upper bound; all other limits are lower bounds.
+    Publication-date counts use distinct UTC dates rather than trading sessions.
+    """
 
     span_months: int = 24
     covered_month_fraction: float = 0.75
@@ -22,7 +31,7 @@ class CoverageThresholds:
 
 @dataclass(frozen=True)
 class PreparationConfig:
-    """Validated settings for one preparation run."""
+    """Immutable run settings with parsed dates and a resolved output path."""
 
     start_date: date | None
     end_date: date | None
@@ -31,6 +40,7 @@ class PreparationConfig:
 
 
 def _parse_date(value: Any, field_name: str) -> date | None:
+    """Parse an ISO date, permitting null or empty values for open bounds."""
     if value in (None, ""):
         return None
     if not isinstance(value, str):
@@ -42,7 +52,21 @@ def _parse_date(value: Any, field_name: str) -> date | None:
 
 
 def load_config(path: Path, root: Path, overrides: dict[str, Any] | None = None) -> PreparationConfig:
-    """Load JSON settings and apply non-None command-line overrides."""
+    """Load preparation settings and apply explicitly supplied CLI overrides.
+
+    Args:
+        path: Required JSON configuration file.
+        root: Base directory for a relative output path.
+        overrides: CLI values; None entries leave configured values unchanged.
+
+    Returns:
+        Immutable settings with inclusive date bounds and validated thresholds.
+
+    Raises:
+        TypeError: The top-level JSON or coverage section is not an object.
+        ValueError: Dates, threshold names, or threshold values are invalid.
+        OSError: The file cannot be read.
+    """
     with path.open(encoding="utf-8") as source:
         values = json.load(source)
     if not isinstance(values, dict):
@@ -63,6 +87,7 @@ def load_config(path: Path, root: Path, overrides: dict[str, Any] | None = None)
     if unknown:
         raise ValueError(f"Unknown coverage settings: {', '.join(sorted(unknown))}")
     coverage = CoverageThresholds(**raw_coverage)
+    # bool subclasses int in Python, but true/false are not meaningful counts.
     for name in ("span_months", "distinct_publication_dates", "articles"):
         value = getattr(coverage, name)
         if type(value) is not int or value < 1:

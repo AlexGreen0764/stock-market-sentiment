@@ -1,4 +1,9 @@
-"""Prepare stock prices and assign news to the next trading session."""
+"""Clean raw OHLCV prices and news into typed Parquet tables for Power BI.
+
+News qualification is measured independently of price eligibility. Publication
+dates are UTC; reaction dates come from observed price sessions rather than a
+separate exchange calendar. This stage does not calculate sentiment.
+"""
 
 from __future__ import annotations
 
@@ -26,6 +31,8 @@ PRICE_COUNT_KEYS = (
     "price_rows_invalid_parse", "price_rows_invalid_nonfinite", "price_rows_invalid_nonpositive_price",
     "price_rows_invalid_volume", "price_rows_invalid_ohlc_bounds",
 )
+# Explicit Arrow types keep dates usable as Power BI relationship keys and give
+# empty outputs the same schema as populated outputs.
 PRICE_SCHEMA = pa.schema([
     ("ticker", pa.string()), ("date", pa.date32()),
     ("open", pa.float64()), ("high", pa.float64()), ("low", pa.float64()),
@@ -43,7 +50,21 @@ EVENT_SCHEMA = pa.schema([
 
 
 def load_prices(source_path: Path, counts: Counter, invalid_examples: dict[str, list[dict]]) -> list[dict]:
-    """Read per-ticker CSV files by header name and validate OHLCV rows."""
+    """Clean one price history and calculate returns and prior-volume ratios.
+
+    Args:
+        source_path: CSV whose filename stem identifies the ticker.
+        counts: Mutable counters updated for accepted, invalid, and duplicate rows.
+        invalid_examples: Shared audit samples, capped at three rows per reason.
+
+    Returns:
+        Valid rows in ascending date order, with Python dates and integer volumes.
+        Each date retains its first valid input row.
+
+    Raises:
+        ValueError: The CSV lacks required price columns.
+        OSError: The source cannot be read.
+    """
     ticker = source_path.stem.strip().upper()
     by_date = {}
     with source_path.open(encoding="utf-8-sig", newline="") as source:
@@ -56,6 +77,8 @@ def load_prices(source_path: Path, counts: Counter, invalid_examples: dict[str, 
             try:
                 day = date.fromisoformat(raw["date"])
                 values = {name: float(raw[name]) for name in PRICE_COLUMNS[1:-1]}
+                # Accept integral decimal notation without rounding large volumes
+                # through a binary float or silently truncating fractional shares.
                 volume_value = Decimal(raw["volume"])
             except (ValueError, TypeError, KeyError, OverflowError, InvalidOperation):
                 reason = "parse"
@@ -70,6 +93,7 @@ def load_prices(source_path: Path, counts: Counter, invalid_examples: dict[str, 
                 elif (values["low"] > min(values["open"], values["close"], values["high"])
                       or values["high"] < max(values["open"], values["close"], values["low"])):
                     reason = "ohlc_bounds"
+            # Assign one rejection reason per row so audit subtotals reconcile.
             if reason:
                 counts["price_rows_invalid"] += 1
                 counts[f"price_rows_invalid_{reason}"] += 1
@@ -85,6 +109,8 @@ def load_prices(source_path: Path, counts: Counter, invalid_examples: dict[str, 
                 "high": values["high"], "low": values["low"], "close": values["close"],
                 "adj_close": values["adj close"], "volume": int(volume_value),
             }
+    # Calculate using full history before the export window is applied, so its
+    # first exported return can still reference the preceding available session.
     rows = [by_date[day] for day in sorted(by_date)]
     previous_adjusted_close = None
     previous_volumes = deque(maxlen=20)
@@ -93,6 +119,7 @@ def load_prices(source_path: Path, counts: Counter, invalid_examples: dict[str, 
             round(100 * (row["adj_close"] / previous_adjusted_close - 1), 4)
             if previous_adjusted_close is not None else None
         )
+        # The current volume enters the deque only after its ratio is calculated.
         average = sum(previous_volumes) / len(previous_volumes) if previous_volumes else 0
         row["volume_vs_prior_20d"] = round(row["volume"] / average, 4) if average else None
         previous_adjusted_close = row["adj_close"]
@@ -102,9 +129,15 @@ def load_prices(source_path: Path, counts: Counter, invalid_examples: dict[str, 
 
 
 def next_trading_day(article_day: date, trading_days: list[date]) -> date | None:
-    """Find a later session within seven days, excluding pre-history articles."""
+    """Return the first observed session strictly after a UTC article date.
+
+    ``trading_days`` must be sorted ascending. Return None for pre-history dates,
+    exhausted histories, or gaps over seven calendar days. The gap limit guards
+    against stale matches; it does not validate an exchange holiday calendar.
+    """
     if not trading_days or article_day < trading_days[0]:
         return None
+    # Exclude same-day reactions because source timestamps may be placeholders.
     position = bisect_right(trading_days, article_day)
     if position == len(trading_days):
         return None
@@ -113,17 +146,25 @@ def next_trading_day(article_day: date, trading_days: list[date]) -> date | None
 
 
 def in_date_range(day: date, start_date: date | None, end_date: date | None) -> bool:
+    """Test inclusive bounds, treating None as an open endpoint."""
     return (start_date is None or day >= start_date) and (end_date is None or day <= end_date)
 
 
 def coverage_by_ticker(events: list[dict], tickers: list[str], thresholds: CoverageThresholds) -> dict[str, dict]:
-    """Measure monthly continuity, including empty months between first and last."""
+    """Summarize coverage and failed criteria for every supplied ticker.
+
+    Events must already be deduplicated and matched to usable price sessions.
+    The denominator includes every month from first to last eligible article,
+    including both endpoints; it is not the entire configured publication window.
+    Tickers without events receive zero counts and null coverage bounds.
+    """
     months = defaultdict(Counter)
     publication_dates = defaultdict(set)
     years = defaultdict(Counter)
     for event in events:
         day = event["article_date_utc"]
         ticker = event["ticker"]
+        # Consecutive month indices make gaps comparable across year boundaries.
         months[ticker][day.year * 12 + day.month - 1] += 1
         publication_dates[ticker].add(day)
         years[ticker][day.year] += 1
@@ -133,6 +174,7 @@ def coverage_by_ticker(events: list[dict], tickers: list[str], thresholds: Cover
         counts = months[ticker]
         occupied = sorted(counts)
         span = occupied[-1] - occupied[0] + 1 if occupied else 0
+        # Only gaps within the observed span count; neither outer endpoint is empty.
         longest_gap = max((right - left - 1 for left, right in pairwise(occupied)), default=0)
         dates = publication_dates[ticker]
         metrics = {
@@ -163,8 +205,24 @@ def load_articles(
     path: Path, tickers: set[str], start_date: date | None, end_date: date | None,
     counts: Counter, ticker_counts: dict[str, Counter],
 ) -> dict[str, list[dict]]:
-    """Read matching in-window article metadata, leaving article bodies on disk."""
+    """Scan news once and retain in-window metadata grouped by matching ticker.
+
+    Args:
+        path: Raw article CSV, including potentially multiline article bodies.
+        tickers: Normalized symbols discovered from price filenames.
+        start_date: Inclusive publication-date lower bound, or None.
+        end_date: Inclusive publication-date upper bound, or None.
+        counts: Mutable counters for global filtering and completeness statistics.
+        ticker_counts: Mutable per-ticker counters for date filtering diagnostics.
+
+    Returns:
+        Metadata lists containing UTC timestamps, dates, and completeness flags.
+        Missing publishers and URLs are retained; empty titles are excluded.
+        Deduplication and session matching occur later in preparation.
+    """
     articles = defaultdict(list)
+    # Article bodies can exceed the CSV parser's default limit. They must be
+    # parsed to respect quoted newlines, but are not retained in memory.
     csv.field_size_limit(100_000_000)
     with path.open(encoding="utf-8-sig", newline="") as source:
         reader = csv.DictReader(source)
@@ -218,12 +276,30 @@ def prepare(
     end_date: date | None = None,
     coverage: CoverageThresholds | None = None,
 ) -> dict:
-    """Evaluate every price-file ticker and write prices independently of news coverage."""
+    """Build both visualization tables and return the preparation audit.
+
+    Args:
+        root: Repository root containing the raw inputs and report directory.
+        output: Destination for the two Parquet files.
+        start_date: Inclusive publication and base price-export lower bound.
+        end_date: Inclusive publication and base price-export upper bound.
+        coverage: News qualification thresholds; None uses the project defaults.
+
+    Prices remain eligible when their news fails coverage. Linked sessions from
+    retained news may extend beyond end_date. Files are staged before replacement;
+    replacement is atomic per file, not a transaction across both files.
+
+    Raises:
+        ValueError: Dates, discovered ticker identities, or input schemas are invalid.
+        OSError: Inputs cannot be read or outputs cannot be written.
+    """
     if start_date and end_date and start_date > end_date:
         raise ValueError("start_date must be on or before end_date")
     coverage = coverage or CoverageThresholds()
     price_folder = root / "data" / "raw" / "full_history"
     source_files = sorted(path for path in price_folder.glob("*.csv") if path.is_file())
+    # Normalize identity, but preserve paths so lowercase filenames work on
+    # case-sensitive filesystems too. Reject collisions instead of overwriting one.
     price_files = {path.stem.strip().upper(): path for path in source_files}
     if len(price_files) != len(source_files):
         raise ValueError("Multiple price files resolve to the same normalized ticker")
@@ -248,6 +324,8 @@ def prepare(
         with parquet.ParquetWriter(price_path, PRICE_SCHEMA) as price_writer, parquet.ParquetWriter(
             news_path, EVENT_SCHEMA
         ) as news_writer:
+            # Keep only one full price history in memory. Article metadata is
+            # released ticker by ticker as the large input scan is consumed.
             for ticker in tickers:
                 price_counts = Counter()
                 rows = load_prices(price_files[ticker], price_counts, invalid_price_examples)
@@ -261,6 +339,8 @@ def prepare(
                     if session is None:
                         counts["article_rows_unusable_price_match"] += 1
                         continue
+                    # This set is local to a ticker: an article may legitimately
+                    # appear once for each company it is associated with.
                     key = event["url"] or (event["published_at_utc"], event["title"])
                     if key in seen:
                         counts["article_rows_duplicate"] += 1
@@ -278,6 +358,8 @@ def prepare(
                     counts["article_rows_kept_missing_publisher"] += sum(not event["has_publisher"] for event in events)
                     counts["article_rows_kept_missing_url"] += sum(not event["has_url"] for event in events)
                     linked_sessions = {event["next_trading_date"] for event in events}
+                # Keep all valid in-window prices, plus any out-of-window session
+                # needed to join retained year-end news to its subsequent return.
                 selected_rows = [
                     row for row in rows
                     if in_date_range(row["date"], start_date, end_date) or row["date"] in linked_sessions
@@ -304,6 +386,7 @@ def prepare(
         price_path.unlink(missing_ok=True)
         news_path.unlink(missing_ok=True)
 
+    # Report totals count article-ticker records, not globally unique articles.
     retained_tickers = [ticker for ticker in tickers if coverage_summary[ticker]["passes"]]
     retained_articles_by_year = Counter()
     retained_tickers_by_year = Counter()
@@ -355,6 +438,7 @@ def prepare(
 
 
 def main() -> None:
+    """Apply preparation CLI overrides and print the generated audit as JSON."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument("--config", type=Path, help="JSON configuration file")

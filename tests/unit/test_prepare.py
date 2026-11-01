@@ -20,10 +20,12 @@ from stock_market_sentiment.prepare import (
     prepare,
 )
 
+# Tiny fixtures exercise export behavior without relaxing production defaults.
 SMALL_COVERAGE = CoverageThresholds(span_months=1, covered_month_fraction=1, max_empty_months=0, distinct_publication_dates=1, articles=1)
 
 
 class PreparationTests(unittest.TestCase):
+    """Exercise cleaning and coverage rules using isolated temporary inputs."""
     def test_package_entry_point_finds_repository_config(self):
         with patch("sys.argv", ["stock-market-sentiment"]), patch(
             "stock_market_sentiment.prepare.prepare", return_value={}
@@ -45,6 +47,7 @@ class PreparationTests(unittest.TestCase):
             year, month = 2009 + index // 12, index % 12 + 1
             for day in range(1, 7):
                 events.append({"ticker": "SAME_DAY", "article_date_utc": date(year, month, 1)})
+                # PASS sits exactly on 75%; GAP isolates the continuity failure.
                 if index not in (4, 8, 12, 16, 20, 22):
                     events.append({"ticker": "PASS", "article_date_utc": date(year, month, day)})
                 if index not in (4, 5, 6, 7):
@@ -174,6 +177,7 @@ class PreparationTests(unittest.TestCase):
             root = Path(temp)
             folder = root / "data" / "raw" / "full_history"
             folder.mkdir(parents=True)
+            # Mixed filename casing and decimal volumes guard earlier data-loss bugs.
             (folder / "nEw.csv").write_text(
                 "date,open,high,low,close,adj close,volume\n"
                 "2020-12-30,10,11,9,10,10,100\n"
@@ -233,6 +237,7 @@ class PreparationTests(unittest.TestCase):
                 ("2020-01-10", "10", "9", "9", "100"),
                 ("bad-date", "10", "11", "9", "100"),
                 ("2020-01-12", "10", "11", "9", "bad-volume"),
+                # Above 2**53: a float intermediate would lose the final share.
                 ("2020-01-13", "10", "11", "9", "9007199254740993.0"),
             ]
             with source.open("w", newline="", encoding="utf-8") as target:

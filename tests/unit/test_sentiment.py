@@ -26,6 +26,7 @@ PROBABILITIES = {
 
 
 def write_fixture(path: Path, titles: list[str]) -> None:
+    """Write typed news rows whose stable identities expose ordering regressions."""
     rows = [{
         "ticker": "ABC", "title": title,
         "published_at_utc": datetime(2020, 12, 31, 14, tzinfo=timezone.utc),
@@ -38,6 +39,7 @@ def write_fixture(path: Path, titles: list[str]) -> None:
 
 
 class SentimentTests(unittest.TestCase):
+    """Verify score semantics and file safety without weights, CUDA, or network."""
     def test_signed_score_and_confidence_are_distinct(self):
         positive = summarize_probabilities([0.1, 0.2, 0.7])
         self.assertAlmostEqual(positive["sentiment_score"], 0.6)
@@ -63,6 +65,8 @@ class SentimentTests(unittest.TestCase):
             original = parquet.read_table(path)
             report = score_news(path, report_path)
             scored = parquet.read_table(path)
+            # Compare Arrow tables directly to avoid timezone database dependencies
+            # when converting UTC timestamps to Python objects on Windows.
             self.assertEqual(scored.select(EVENT_SCHEMA.names).replace_schema_metadata(original.schema.metadata), original)
             self.assertEqual(scored.column("title").to_pylist(), list(PROBABILITIES))
             self.assertEqual(scored.column("sentiment_label").to_pylist(), ["positive", "neutral", "negative"])
@@ -88,6 +92,7 @@ class SentimentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "news.parquet"
             report_path = Path(temp) / "report.json"
+            # Cross a chunk boundary so failure occurs after a partial output write.
             write_fixture(path, ["Annual meeting scheduled"] * 8193)
             original = path.read_bytes()
             report_path.write_text("previous report", encoding="utf-8")
