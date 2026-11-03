@@ -17,17 +17,15 @@ Python preparation and local SLM sentiment scoring for a Power BI school visuali
 | `reports/quality_report.json` | Preparation audit |
 | `reports/sentiment_report.json` | Sentiment audit |
 
-The large raw files stay outside Git. Keep the local news export if the team may need article bodies later. URLs alone do not guarantee continued access to original articles. Source provenance and licensing still need confirmation from the data provider.
+Raw data, processed data, and reports stay outside Git. Keep the raw news export if article bodies may be needed later.
 
 ## Installation
 
-Requires **Python 3.11+**; validation has used Python 3.13. Dependencies are in [pyproject.toml](./pyproject.toml).
+Tested with **Python 3.13**, **PyTorch 2.15.0+cu134**, and **Transformers 5.22.1**. Dependency constraints are defined in [pyproject.toml](./pyproject.toml).
 
 - Preparation uses PyArrow and does not need a GPU.
-- Scoring requires an NVIDIA GPU supporting CUDA and BF16, a compatible driver, and CUDA-enabled PyTorch. There is no CPU scoring mode.
-- The 4B model has approximately 8 GB of BF16 weights, plus runtime and batch memory. The fixed batch size is 4.
-- Dependencies and the pinned tokenizer/weights need internet access on first download. Inference runs locally.
-- Preparation retains candidate headline metadata in RAM. It does not materialize bodies or maintain global URL association sets. Scoring streams bounded Parquet chunks.
+- Scoring runs on an NVIDIA GPU with CUDA-enabled PyTorch using BF16. Model weights occupy roughly 8 GB, with additional memory needed during inference.
+- Initial package and model downloads need internet access. Inference runs locally.
 
 PowerShell, from the repository root:
 
@@ -37,7 +35,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e .
 ```
 
-The PyTorch wheel includes its CUDA runtime; a separate CUDA Toolkit is not required. Transformers 5.22.1 or newer (below 6) is required for the validated Qwen3.5 text loader. The official checkpoint download is roughly 9 GB and is cached for subsequent runs. Transformers may warn that reference PyTorch convolution/linear-attention kernels are used; these support correct inference but can affect throughput.
+The model download is roughly 9 GB and is cached for subsequent runs.
 
 Optional Flash Linear Attention acceleration on Windows uses the following tested package versions:
 
@@ -45,7 +43,7 @@ Optional Flash Linear Attention acceleration on Windows uses the following teste
 .\.venv\Scripts\python.exe -m pip install "flash-linear-attention==0.6.0" "fla-core==0.6.0" "triton-windows==3.8.0.post29"
 ```
 
-FLA accelerates linear attention; the separate optional `causal-conv1d` package accelerates convolution.
+FLA accelerates the model's linear-attention operations.
 
 ## 1. Prepare the study dataset
 
@@ -65,9 +63,9 @@ Defaults:
 
 Preparation evaluates every ticker with a price CSV. News symbols and filename stems are trimmed and uppercased; original paths are preserved, including mixed-case filenames. Normalized filename collisions are rejected. Historical aliases and multiple ticker symbols in one field are not resolved.
 
-The raw news file is read once with projected columns, respecting quoted multiline fields while skipping body/summary conversion. Empty headlines and invalid/out-of-window publication timestamps are rejected. Missing publishers and URLs are flagged and retained. Duplicate URLs are removed within each ticker; rows without URLs use publication timestamp plus title. Broad articles remain eligible.
+Empty headlines and invalid/out-of-window publication timestamps are rejected. Missing publishers and URLs are flagged and retained. Duplicate URLs are removed within each ticker; rows without URLs use publication timestamp plus title. Articles associated with multiple tickers remain eligible.
 
-Each article is matched to the first observed valid price session **strictly after** its UTC publication date, at most seven calendar days later. Articles before the first price date or without a usable later session are rejected. This uses observed price histories, not a formal exchange calendar. Publication timestamps may be placeholders, so same-day reactions are deliberately excluded.
+Each article is matched to the first observed valid price session **strictly after** its UTC publication date, at most seven calendar days later. Articles before the first price date or without a usable later session are rejected. Trading dates come from observed price histories. Publication dates and timestamps are retained separately.
 
 ### Coverage and selection
 
@@ -116,13 +114,13 @@ After preparation:
 
 The scorer uses [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B), pinned with its tokenizer to commit `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`. It reads `data/processed/news_events.parquet` and writes `reports/sentiment_report.json`. It does not read preparation configuration; a custom preparation output path is not automatically picked up.
 
-The compact prompt asks for sentiment toward the target ticker using only the supplied headline. Generic roundups, an unidentified target, and insufficient target-specific evidence should produce an abstention. The model receives no bodies or future prices. These instructions do not guarantee correct classifications.
+The prompt asks for sentiment toward the target ticker using only the supplied headline. Generic roundups, an unidentified target, and insufficient target-specific evidence should produce an abstention.
 
 Routine target-company announcements (meeting dates, earnings schedules, filings, conference appearances, and previews without results) are neutral. Insufficient information means the target cannot be identified or the headline omits its specific situation. Mixed means material opposing implications without a clearly dominant direction; it is distinct from both neutral and missing context.
 
-Fixed settings in [sentiment.py](./src/stock_market_sentiment/sentiment.py): CUDA/BF16, SDPA, batches of 4, 8,192-row chunks, and a 1,024-token prompt budget. Overlength prompts fail explicitly rather than silently truncating text. Weights use roughly 8 GB before activation/runtime overhead.
+Fixed settings in [sentiment.py](./src/stock_market_sentiment/sentiment.py): CUDA/BF16, SDPA, batches of 4, 8,192-row chunks, and a 1,024-token prompt budget. Prompts exceeding the budget produce an error.
 
-The scorer loads the text-only Qwen3.5 configuration and model, excluding the vision encoder. Thinking is explicitly disabled in the chat template with `enable_thinking=False`. The model selects the highest next-token logit among five permitted answer letters. It performs one forward pass per batch, with no free-form generation, reasoning output, or KV cache. Left padding and token-length grouping reduce padding work; outputs are restored to input order. Identical **ticker/headline pairs** are scored once per chunk; the same headline for different tickers is scored separately.
+The scorer uses Qwen3.5's text-only model with thinking disabled. It selects one of five answer tokens in a single forward pass. Identical **ticker/headline pairs** are scored once per chunk; the same headline for different tickers is scored separately.
 
 | Label | `sentiment_score` |
 | --- | --- |
@@ -134,11 +132,11 @@ The scorer loads the text-only Qwen3.5 configuration and model, excluding the vi
 
 **The score is an ordinal category code.** No confidence or class probabilities are exported. Mixed evidence and insufficient information remain separate labels, each with a null score.
 
-The sentiment report includes model/revision, the exact compact prompt, answer method, `thinking_enabled=false`, `model_input_mode=text_only`, input columns, token/batch limits, counts for all five labels, inference counts, throughput, and elapsed time. The prompt and thinking setting are also stored in Parquet metadata. The mean score excludes null scores; `numeric_score_rows` records its denominator and includes neutral rows. Report the abstention share alongside numeric sentiment summaries.
+The sentiment report records model settings, the prompt, label counts, inference counts, throughput, and elapsed time. Model and prompt details are also stored in Parquet metadata. The mean score excludes null scores; `numeric_score_rows` records its denominator and includes neutral rows.
 
 Progress prints after each 8,192-row chunk, showing records scored, average records per second, and estimated minutes remaining. Model loading and initial GPU kernel compilation occur before the first scoring update.
 
-Scoring stages a partial file and replaces the original only after all rows score successfully. Inference failure preserves the original. Dates and non-sentiment columns are preserved. Data and reports are replaced individually, not as a multi-file transaction. Preparation recreates unscored news; score after your final preparation run.
+Scoring replaces the news file after all rows score successfully, preserving dates and non-sentiment columns. An inference failure leaves the original file intact. Preparation overwrites sentiment results, so run scoring after preparation.
 
 ## Power BI interpretation
 
