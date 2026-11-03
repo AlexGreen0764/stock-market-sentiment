@@ -227,7 +227,7 @@ class PreparationTests(unittest.TestCase):
             root = Path(temp)
             folder = root / "data" / "raw" / "full_history"
             folder.mkdir(parents=True)
-            # Mixed filename casing and decimal volumes guard earlier data-loss bugs.
+            # Exercise mixed filename casing and integral decimal volumes together.
             (folder / "nEw.csv").write_text(
                 "date,open,high,low,close,adj close,volume\n"
                 "2020-12-30,10,11,9,10,10,100\n"

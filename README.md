@@ -16,7 +16,6 @@ Python preparation and local SLM sentiment scoring for a Power BI school visuali
 | `data/processed/` | Two generated Parquet visualization tables |
 | `reports/quality_report.json` | Preparation audit |
 | `reports/sentiment_report.json` | Sentiment audit |
-| `Final Project_SP.pdf` | Supplied course project brief |
 
 The large raw files stay outside Git. Keep the local news export if the team may need article bodies later. URLs alone do not guarantee continued access to original articles. Source provenance and licensing still need confirmation from the data provider.
 
@@ -39,6 +38,14 @@ python -m venv .venv
 ```
 
 The PyTorch wheel includes its CUDA runtime; a separate CUDA Toolkit is not required. Transformers 5.22.1 or newer (below 6) is required for the validated Qwen3.5 text loader. The official checkpoint download is roughly 9 GB and is cached for subsequent runs. Transformers may warn that reference PyTorch convolution/linear-attention kernels are used; these support correct inference but can affect throughput.
+
+Optional Flash Linear Attention acceleration on Windows uses the following tested package versions:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install "flash-linear-attention==0.6.0" "fla-core==0.6.0" "triton-windows==3.8.0.post29"
+```
+
+FLA accelerates linear attention; the separate optional `causal-conv1d` package accelerates convolution.
 
 ## 1. Prepare the study dataset
 
@@ -125,9 +132,11 @@ The scorer loads the text-only Qwen3.5 configuration and model, excluding the vi
 | `mixed` | null |
 | `insufficient_information` | null |
 
-**This score is an ordinal category code, not the old FinSense positive-minus-negative probability score.** No confidence or class probabilities are exported. Reruns remove the former FinSense probability columns. Mixed evidence and insufficient information remain separate labels, and neither becomes neutral.
+**The score is an ordinal category code.** No confidence or class probabilities are exported. Mixed evidence and insufficient information remain separate labels, each with a null score.
 
 The sentiment report includes model/revision, the exact compact prompt, answer method, `thinking_enabled=false`, `model_input_mode=text_only`, input columns, token/batch limits, counts for all five labels, inference counts, throughput, and elapsed time. The prompt and thinking setting are also stored in Parquet metadata. The mean score excludes null scores; `numeric_score_rows` records its denominator and includes neutral rows. Report the abstention share alongside numeric sentiment summaries.
+
+Progress prints after each 8,192-row chunk, showing records scored, average records per second, and estimated minutes remaining. Model loading and initial GPU kernel compilation occur before the first scoring update.
 
 Scoring stages a partial file and replaces the original only after all rows score successfully. Inference failure preserves the original. Dates and non-sentiment columns are preserved. Data and reports are replaced individually, not as a multi-file transaction. Preparation recreates unscored news; score after your final preparation run.
 
@@ -135,7 +144,7 @@ Scoring stages a partial file and replaces the original only after all rows scor
 
 Use year → quarter → month → day date hierarchies on the daily/article-level data. Show article counts and abstention counts alongside sentiment. Missing news is not neutral sentiment. Aggregate article scores directly, or weight preaggregated means by their numeric-score counts.
 
-A coverage-selected ticker universe and source collection patterns affect comparisons. Headline sentiment and subsequent price/volume movements show associations only. An SLM replacement is not established as more accurate until evaluated against trusted labels. Fixture tests establish implementation behavior, not financial sentiment accuracy.
+A coverage-selected ticker universe and source collection patterns affect comparisons. Headline sentiment and subsequent price/volume movements show associations only. Sentiment accuracy requires evaluation against trusted labels. Fixture tests establish implementation behavior.
 
 ## Validation
 
@@ -143,6 +152,6 @@ A coverage-selected ticker universe and source collection patterns affect compar
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-Tests verify thinking is disabled, scoring order is restored, and cache-free single-token classification is used. They use temporary fixtures and model doubles; they do not process the full dataset, download model weights, or require a GPU. They cover price validation, full-window coverage and edge gaps, deterministic selection, retention of broad articles, matching output universes, date links, null abstention scores, ticker-specific caching, old-score replacement, and preservation of originals after failures.
+Tests use temporary fixtures and model doubles and require no GPU or model download. They cover price validation, full-window coverage and edge gaps, deterministic ticker selection, matching output universes, date links, disabled thinking, scoring order, single-token classification, null abstention scores, ticker-specific caching, sentiment-column replacement, and preservation of originals after failures.
 
 Generated reports are standard JSON and should not be manually edited. The reports directory is excluded from Git.

@@ -28,7 +28,7 @@ SENTIMENT_SCHEMA = pa.schema([
     ("sentiment_score", pa.float32()),
     ("sentiment_label", pa.string()),
 ])
-# Remove the earlier scorer's probabilities when enriching an existing file.
+# Replace sentiment fields when enriching an existing file.
 REPLACED_FIELDS = set(SENTIMENT_SCHEMA.names) | {
     "sentiment_confidence", "sentiment_negative", "sentiment_neutral", "sentiment_positive",
 }
