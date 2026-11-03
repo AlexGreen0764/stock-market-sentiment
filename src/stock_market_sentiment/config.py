@@ -15,10 +15,10 @@ from typing import Any
 
 @dataclass(frozen=True)
 class CoverageThresholds:
-    """News qualification limits within the first-to-last eligible article span.
+    """News qualification limits across the configured publication window.
 
-    ``covered_month_fraction`` includes empty months in its denominator.
-    ``max_empty_months`` is an upper bound; all other limits are lower bounds.
+    ``covered_month_fraction`` includes all configured months in its denominator.
+    ``max_empty_months`` includes window edges and is an upper bound.
     Publication-date counts use distinct UTC dates rather than trading sessions.
     """
 
@@ -33,16 +33,15 @@ class CoverageThresholds:
 class PreparationConfig:
     """Immutable run settings with parsed dates and a resolved output path."""
 
-    start_date: date | None
-    end_date: date | None
+    start_date: date
+    end_date: date
     output: Path
     coverage: CoverageThresholds
+    max_tickers: int
 
 
-def _parse_date(value: Any, field_name: str) -> date | None:
-    """Parse an ISO date, permitting null or empty values for open bounds."""
-    if value in (None, ""):
-        return None
+def _parse_date(value: Any, field_name: str) -> date:
+    """Require an ISO date so coverage has a fixed denominator."""
     if not isinstance(value, str):
         raise TypeError(f"{field_name} must be an ISO date (YYYY-MM-DD)")
     try:
@@ -77,8 +76,15 @@ def load_config(path: Path, root: Path, overrides: dict[str, Any] | None = None)
 
     start_date = _parse_date(values.get("start_date"), "start_date")
     end_date = _parse_date(values.get("end_date"), "end_date")
-    if start_date and end_date and start_date > end_date:
+    if start_date > end_date:
         raise ValueError("start_date must be on or before end_date")
+
+    limits = {name: values.get(name, default) for name, default in (
+        ("max_tickers", 30),
+    )}
+    for name, value in limits.items():
+        if type(value) is not int or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
 
     raw_coverage = values.get("coverage", {})
     if not isinstance(raw_coverage, dict):
@@ -105,4 +111,5 @@ def load_config(path: Path, root: Path, overrides: dict[str, Any] | None = None)
         end_date=end_date,
         output=output,
         coverage=coverage,
+        **limits,
     )

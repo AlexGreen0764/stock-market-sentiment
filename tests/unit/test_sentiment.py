@@ -1,99 +1,149 @@
-"""Check sentiment math and lossless Parquet enrichment using small fixtures."""
+"""Verify SLM label semantics, ticker-specific caching, and lossless file enrichment."""
 
 import tempfile
 import unittest
 from datetime import UTC, date, datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pyarrow as pa
 from pyarrow import parquet
 
 from stock_market_sentiment.prepare import EVENT_SCHEMA
 from stock_market_sentiment.sentiment import (
+    LABELS,
     MODEL_ID,
     MODEL_REVISION,
+    READ_BATCH_SIZE,
     SENTIMENT_SCHEMA,
+    SLMScorer,
     score_news,
-    summarize_probabilities,
+    summarize_label,
 )
 
-PROBABILITIES = {
-    "Earnings increased": [0.05, 0.15, 0.8],
-    "Annual meeting scheduled": [0.1, 0.8, 0.1],
-    "Profit fell": [0.8, 0.15, 0.05],
+EXAMPLES = {
+    "Earnings increased": "positive",
+    "Annual meeting scheduled": "neutral",
+    "Profit fell": "negative",
 }
 
 
-def write_fixture(path: Path, titles: list[str]) -> None:
-    """Write typed news rows whose stable identities expose ordering regressions."""
+def write_fixture(path: Path, titles: list[str], tickers: list[str] | None = None) -> None:
+    """Write typed rows with unique URLs so caching cannot silently remove records."""
     rows = [{
-        "ticker": "ABC", "title": title,
+        "ticker": tickers[index] if tickers else "ABC", "title": title,
         "published_at_utc": datetime(2020, 12, 31, 14, tzinfo=UTC),
         "article_date_utc": date(2020, 12, 31), "next_trading_date": date(2021, 1, 4),
         "url": f"https://example.test/{index}", "publisher": "Test",
         "has_url": True, "has_publisher": True,
     } for index, title in enumerate(titles)]
-    schema = EVENT_SCHEMA.with_metadata({b"source": b"fixture"})
-    parquet.write_table(pa.Table.from_pylist(rows, schema=schema), path)
+    parquet.write_table(pa.Table.from_pylist(rows, schema=EVENT_SCHEMA.with_metadata({b"source": b"fixture"})), path)
 
 
 class SentimentTests(unittest.TestCase):
-    """Verify score semantics and file safety without weights, CUDA, or network."""
-    def test_signed_score_and_confidence_are_distinct(self):
-        positive = summarize_probabilities([0.1, 0.2, 0.7])
-        self.assertAlmostEqual(positive["sentiment_score"], 0.6)
-        self.assertEqual(positive["sentiment_label"], "positive")
-        self.assertEqual(positive["sentiment_confidence"], 0.7)
-        neutral = summarize_probabilities([0.05, 0.9, 0.05])
-        self.assertEqual(neutral["sentiment_score"], 0)
-        self.assertEqual(neutral["sentiment_label"], "neutral")
+    """Use model doubles: no weights, network, full dataset, or GPU."""
 
-    def test_invalid_model_outputs_are_rejected(self):
-        for probabilities in ([float("nan"), 0, 1], [-0.1, 0.1, 1], [0.1, 0.1, 0.1], [0, 1]):
-            with self.subTest(probabilities=probabilities), self.assertRaises(ValueError):
-                summarize_probabilities(probabilities)
+    def test_abstentions_are_not_neutral_or_numeric(self):
+        for label in ("mixed", "insufficient_information"):
+            self.assertIsNone(summarize_label(label)["sentiment_score"])
+        self.assertEqual(summarize_label("neutral")["sentiment_score"], 0)
+        self.assertEqual(summarize_label("negative")["sentiment_score"], -1)
+        self.assertEqual(summarize_label("positive")["sentiment_score"], 1)
+        with self.assertRaises(ValueError):
+            summarize_label("invalid")
 
-    @patch("stock_market_sentiment.sentiment.FinSenseScorer")
-    def test_enrichment_preserves_dates_rows_metadata_and_supports_reruns(self, model_class):
+    def test_scoring_disables_thinking_and_restores_input_order(self):
+        """Exercise the real scoring method with a tokenizer/model double."""
+        scorer = SLMScorer.__new__(SLMScorer)
+        scorer.tokenizer = MagicMock()
+        scorer.tokenizer.apply_chat_template.return_value = "formatted prompt"
+        scorer.tokenizer.return_value = {"input_ids": [[11, 12, 13], [14]], "attention_mask": [[1, 1, 1], [1]]}
+        scorer.tokenizer.pad.return_value.to.return_value = {"input_ids": "test inputs"}
+        scorer.choice_ids = [32, 33, 34, 35, 36]
+        scorer.model = MagicMock()
+        logits = scorer.model.return_value.logits.__getitem__.return_value
+        # Sorted order is second input first. Restore positive, negative for caller.
+        logits.argmax.return_value.cpu.return_value.tolist.return_value = [0, 2]
+        torch_double = MagicMock()
+        torch_double.isfinite.return_value.all.return_value = True
+        with patch.dict("sys.modules", {"torch": torch_double}):
+            results = scorer.score([("ABC", "Longer headline"), ("DEF", "Short")])
+        self.assertEqual([row["sentiment_label"] for row in results], ["positive", "negative"])
+        for call in scorer.tokenizer.apply_chat_template.call_args_list:
+            self.assertIs(call.kwargs["enable_thinking"], False)
+            self.assertIs(call.kwargs["add_generation_prompt"], True)
+        self.assertIs(scorer.model.call_args.kwargs["use_cache"], False)
+        self.assertEqual(scorer.model.call_args.kwargs["logits_to_keep"], 1)
+
+    @patch("stock_market_sentiment.sentiment.SLMScorer")
+    def test_enrichment_preserves_rows_dates_and_replaces_legacy_scores(self, model_class):
         scorer = model_class.return_value
-        scorer.score.side_effect = lambda titles: [summarize_probabilities(PROBABILITIES[title]) for title in titles]
+        scorer.score.side_effect = lambda items: [summarize_label(EXAMPLES[title]) for _, title in items]
         with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "news.parquet"
-            report_path = Path(temp) / "report.json"
-            write_fixture(path, list(PROBABILITIES))
+            path, report_path = Path(temp) / "news.parquet", Path(temp) / "report.json"
+            write_fixture(path, list(EXAMPLES))
             original = parquet.read_table(path)
+            legacy = original.append_column("sentiment_confidence", pa.array([0.99] * 3))
+            for name in ("sentiment_negative", "sentiment_neutral", "sentiment_positive"):
+                legacy = legacy.append_column(name, pa.array([0.1] * 3))
+            parquet.write_table(legacy, path)
             report = score_news(path, report_path)
             scored = parquet.read_table(path)
-            # Compare Arrow tables directly to avoid timezone database dependencies
-            # when converting UTC timestamps to Python objects on Windows.
             self.assertEqual(scored.select(EVENT_SCHEMA.names).replace_schema_metadata(original.schema.metadata), original)
-            self.assertEqual(scored.column("title").to_pylist(), list(PROBABILITIES))
             self.assertEqual(scored.column("sentiment_label").to_pylist(), ["positive", "neutral", "negative"])
-            for actual, expected in zip(scored.column("sentiment_score").to_pylist(), [0.75, 0, -0.75]):
-                self.assertAlmostEqual(actual, expected)
+            self.assertEqual(scored.column("sentiment_score").to_pylist(), [1, 0, -1])
+            self.assertNotIn("sentiment_confidence", scored.schema.names)
+            self.assertNotIn("sentiment_positive", scored.schema.names)
             self.assertEqual(scored.schema.metadata[b"sentiment_model"].decode(), MODEL_ID)
             self.assertEqual(scored.schema.metadata[b"sentiment_model_revision"].decode(), MODEL_REVISION)
+            self.assertEqual(scored.schema.metadata[b"sentiment_thinking_enabled"], b"false")
+            self.assertFalse(report["thinking_enabled"])
+            self.assertEqual(report["model_input_mode"], "text_only")
             self.assertEqual(report["rows_scored"], 3)
-            self.assertEqual(report["label_counts"], {"negative": 1, "neutral": 1, "positive": 1})
-            self.assertTrue(report_path.is_file())
-            self.assertEqual(scorer.score.call_args_list[0].args, (list(PROBABILITIES),))
+            self.assertEqual(report["numeric_score_rows"], 3)
+            self.assertEqual(report["mean_sentiment_score"], 0)
             self.assertEqual(report["headline_inferences"], 3)
+            self.assertEqual(sum(report["label_counts"].values()), 3)
             score_news(path, report_path)
-            rescored = parquet.read_schema(path)
             for field in SENTIMENT_SCHEMA:
-                self.assertEqual(rescored.names.count(field.name), 1)
-                self.assertEqual(rescored.field(field.name).type, field.type)
+                self.assertEqual(parquet.read_schema(path).names.count(field.name), 1)
 
-    @patch("stock_market_sentiment.sentiment.FinSenseScorer")
-    def test_inference_failure_keeps_original_file_and_report(self, model_class):
+    @patch("stock_market_sentiment.sentiment.SLMScorer")
+    def test_same_title_for_different_tickers_is_scored_separately(self, model_class):
         scorer = model_class.return_value
-        scorer.score.side_effect = [[summarize_probabilities([0.1, 0.8, 0.1])], RuntimeError("Model failure")]
+        scorer.score.side_effect = lambda items: [
+            summarize_label("positive" if ticker == "ABC" else "negative") for ticker, _ in items
+        ]
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "news.parquet"
-            report_path = Path(temp) / "report.json"
-            # Cross a chunk boundary so failure occurs after a partial output write.
-            write_fixture(path, ["Annual meeting scheduled"] * 8193)
+            write_fixture(path, ["A wins business from B"] * 3, ["ABC", "DEF", "ABC"])
+            report = score_news(path, Path(temp) / "report.json")
+            self.assertEqual(scorer.score.call_args.args[0], [("ABC", "A wins business from B"), ("DEF", "A wins business from B")])
+            self.assertEqual(report["headline_inferences"], 2)
+            self.assertEqual(parquet.read_table(path).column("sentiment_score").to_pylist(), [1, -1, 1])
+
+    @patch("stock_market_sentiment.sentiment.SLMScorer")
+    def test_all_abstentions_have_null_mean(self, model_class):
+        model_class.return_value.score.return_value = [
+            summarize_label("mixed"), summarize_label("insufficient_information"),
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "news.parquet"
+            write_fixture(path, ["Mixed evidence", "Roundup"])
+            report = score_news(path, Path(temp) / "report.json")
+            self.assertEqual(report["numeric_score_rows"], 0)
+            self.assertIsNone(report["mean_sentiment_score"])
+            self.assertEqual(parquet.read_table(path).column("sentiment_score").to_pylist(), [None, None])
+            self.assertEqual(set(report["label_counts"]), set(LABELS))
+
+    @patch("stock_market_sentiment.sentiment.SLMScorer")
+    def test_inference_failure_keeps_original_file_and_report(self, model_class):
+        model_class.return_value.score.side_effect = [
+            [summarize_label("neutral")], RuntimeError("Model failure"),
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            path, report_path = Path(temp) / "news.parquet", Path(temp) / "report.json"
+            write_fixture(path, ["Annual meeting scheduled"] * (READ_BATCH_SIZE + 1))
             original = path.read_bytes()
             report_path.write_text("previous report", encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "Model failure"):
@@ -102,24 +152,8 @@ class SentimentTests(unittest.TestCase):
             self.assertEqual(report_path.read_text(), "previous report")
             self.assertEqual(sorted(file.name for file in Path(temp).iterdir()), ["news.parquet", "report.json"])
 
-    @patch("stock_market_sentiment.sentiment.FinSenseScorer")
-    def test_duplicate_headlines_score_once_without_losing_rows(self, model_class):
-        scorer = model_class.return_value
-        scorer.score.side_effect = lambda titles: [summarize_probabilities(PROBABILITIES[title]) for title in titles]
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "news.parquet"
-            titles = ["Profit fell", "Earnings increased", "Profit fell", "Annual meeting scheduled", "Profit fell"]
-            write_fixture(path, titles)
-            report = score_news(path, Path(temp) / "report.json")
-            table = parquet.read_table(path)
-            self.assertEqual(table.column("title").to_pylist(), titles)
-            self.assertEqual(table.column("sentiment_label").to_pylist(), ["negative", "positive", "negative", "neutral", "negative"])
-            self.assertEqual(report["rows_scored"], 5)
-            self.assertEqual(report["headline_inferences"], 3)
-            self.assertEqual(report["label_counts"], {"negative": 3, "neutral": 1, "positive": 1})
-
-    @patch("stock_market_sentiment.sentiment.FinSenseScorer")
-    def test_empty_news_rejected_without_loading_model(self, model_class):
+    @patch("stock_market_sentiment.sentiment.SLMScorer")
+    def test_empty_news_rejected_before_model_loading(self, model_class):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "news.parquet"
             write_fixture(path, [])

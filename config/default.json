@@ -1,7 +1,8 @@
 {
-  "start_date": "2009-01-01",
+  "start_date": "2015-01-01",
   "end_date": "2020-12-31",
   "output": "data/processed",
+  "max_tickers": 30,
   "coverage": {
     "span_months": 24,
     "covered_month_fraction": 0.75,

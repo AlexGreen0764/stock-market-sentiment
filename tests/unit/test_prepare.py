@@ -37,8 +37,9 @@ class PreparationTests(unittest.TestCase):
     def test_default_config_uses_reliable_article_window(self):
         root = Path(__file__).resolve().parents[2]
         config = load_config(root / "config" / "default.json", root)
-        self.assertEqual(config.start_date, date(2009, 1, 1))
+        self.assertEqual(config.start_date, date(2015, 1, 1))
         self.assertEqual(config.end_date, date(2020, 12, 31))
+        self.assertEqual(config.max_tickers, 30)
         self.assertEqual(config.coverage, CoverageThresholds(24, 0.75, 3, 60, 100))
 
     def test_monthly_coverage_requires_continuity_depth_and_distinct_days(self):
@@ -55,7 +56,7 @@ class PreparationTests(unittest.TestCase):
                 if index % 2 == 0 or index == 23:
                     events.append({"ticker": "SPARSE", "article_date_utc": date(year, month, day)})
             events.append({"ticker": "SHALLOW", "article_date_utc": date(year, month, 1)})
-        summary = coverage_by_ticker(events, ["PASS", "SAME_DAY", "SHALLOW", "GAP", "SPARSE", "ABSENT"], CoverageThresholds())
+        summary = coverage_by_ticker(events, ["PASS", "SAME_DAY", "SHALLOW", "GAP", "SPARSE", "ABSENT"], CoverageThresholds(), date(2009, 1, 1), date(2010, 12, 31))
         self.assertTrue(summary["PASS"]["passes"])
         self.assertEqual(summary["PASS"]["span_months"], 24)
         self.assertEqual(summary["PASS"]["covered_months"], 18)
@@ -79,6 +80,55 @@ class PreparationTests(unittest.TestCase):
         self.assertIsNone(next_trading_day(date(2023, 12, 21), days))
         self.assertIsNone(next_trading_day(date(2023, 12, 22), [date(2023, 12, 22), date(2024, 1, 2)]))
         self.assertIsNone(next_trading_day(date(2023, 12, 22), []))
+
+    def test_coverage_includes_empty_window_edges(self):
+        events = [{"ticker": "ABC", "article_date_utc": date(2020, month, 1)} for month in (5, 6)]
+        result = coverage_by_ticker(events, ["ABC"], SMALL_COVERAGE, date(2020, 1, 1), date(2020, 6, 30))["ABC"]
+        self.assertEqual(result["window_months"], 6)
+        self.assertEqual(result["covered_month_fraction"], 2 / 6)
+        self.assertEqual(result["max_empty_months"], 4)
+        self.assertIn("covered_month_fraction", result["failed_criteria"])
+        self.assertIn("max_empty_months", result["failed_criteria"])
+
+    def test_broad_articles_retained_and_top_ticker_selected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            folder = root / "data/raw/full_history"
+            folder.mkdir(parents=True)
+            for ticker in ("ABC", "DEF", "XYZ"):
+                (folder / f"{ticker}.csv").write_text(
+                    "date,open,high,low,close,adj close,volume\n"
+                    "2023-12-20,10,11,9,10,10,100\n"
+                    "2023-12-21,10,11,9,10,10,100\n"
+                    "2023-12-22,10,11,9,10,10,100\n"
+                    "2023-12-26,10,11,9,10,10,100\n", encoding="utf-8",
+                )
+            with (folder.parent / "nasdaq_exteral_data.csv").open("w", newline="", encoding="utf-8") as target:
+                writer = csv.writer(target)
+                writer.writerow(["Date", "Article_title", "Stock_symbol", "Url", "Publisher", "Article"])
+                for ticker in ("ABC", "XYZ"):
+                    for index, day in enumerate((21, 22, 24)):
+                        body = ("First paragraph.\n\nSecond paragraph.", "", "NULL")[index]
+                        writer.writerow([f"2023-12-{day} 14:00:00 UTC", f"Item {index}", ticker, f"{ticker}/{index}", "Test", body])
+                for index in range(5):
+                    writer.writerow(["2023-12-22 14:00:00 UTC", f"DEF {index}", "DEF", f"DEF/{index}", "Test", "Body"])
+                # Broad articles remain eligible, including URLs tagged outside the
+                # requested window and for tickers without price files.
+                for ticker in ("ABC", "OUT1", "OUT2", "OUT3", "OUT4", "OUT5", "OUT5"):
+                    published = "2023-12-22" if ticker == "ABC" else "2000-01-01"
+                    writer.writerow([f"{published} 14:00:00 UTC", "Broad", ticker, "shared", "Test", "Broad body"])
+                # Repeated tags for unmatched tickers have no effect on selection.
+                for ticker in ("ABC", "OUT1", "OUT2", "OUT3", "OUT4", "OUT4"):
+                    published = "2023-12-22" if ticker == "ABC" else "2000-01-01"
+                    writer.writerow([f"{published} 14:00:00 UTC", "At cap", ticker, "at-cap", "Test", "Preserved"])
+            report = prepare(root, root / "out", date(2023, 12, 1), date(2023, 12, 31), SMALL_COVERAGE, max_tickers=1)
+            self.assertEqual(report["retained_tickers"], ["ABC"])
+            self.assertEqual(report["ticker_ranking"], ["ABC", "XYZ", "DEF"])
+            self.assertEqual(report["qualified_but_not_selected"], ["DEF", "XYZ"])
+            news = parquet.read_table(root / "out/news_events.parquet", columns=["title"]).to_pylist()
+            self.assertEqual([row["title"] for row in news], ["Item 0", "Item 1", "Item 2", "Broad", "At cap"])
+            prices = parquet.read_table(root / "out/daily_prices.parquet", columns=["ticker"]).to_pylist()
+            self.assertEqual({row["ticker"] for row in prices}, {"ABC"})
 
     def test_pipeline_reads_reordered_prices_and_multiline_news(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -106,7 +156,7 @@ class PreparationTests(unittest.TestCase):
                 writer.writerow(["2023-12-21 14:00:00 UTC", "Earlier", "ABC", "https://example.test/3", "Test", "Prior publication date"])
                 writer.writerow(["2023-12-22 14:00:00 UTC", "Sparse", "DEF", "https://example.test/4", "Test", "One article"])
             output = root / "out"
-            report = prepare(root, output, coverage=CoverageThresholds(1, 1, 0, 2, 2))
+            report = prepare(root, output, date(2023, 12, 1), date(2023, 12, 31), CoverageThresholds(1, 1, 0, 2, 2))
             self.assertEqual(report["counts"]["price_rows_invalid"], 1)
             self.assertEqual(report["counts"]["price_rows_duplicate_date"], 1)
             self.assertEqual(report["counts"]["article_rows_kept"], 2)
@@ -114,19 +164,19 @@ class PreparationTests(unittest.TestCase):
             self.assertEqual(report["retained_tickers"], ["ABC"])
             self.assertEqual(report["rejected_tickers"], ["DEF"])
             self.assertEqual(report["candidate_tickers"], ["ABC", "DEF"])
-            self.assertEqual(report["price_tickers"], ["ABC", "DEF"])
-            self.assertEqual(report["counts"]["price_rows_kept"], 5)
+            self.assertEqual(report["price_tickers"], ["ABC"])
+            self.assertEqual(report["counts"]["price_rows_kept"], 3)
             self.assertEqual(sorted(path.name for path in output.iterdir()), ["daily_prices.parquet", "news_events.parquet"])
             self.assertTrue((root / "reports" / "quality_report.json").is_file())
             rows = parquet.read_table(output / "daily_prices.parquet").to_pylist()
-            self.assertEqual({row["ticker"] for row in rows}, {"ABC", "DEF"})
+            self.assertEqual({row["ticker"] for row in rows}, {"ABC"})
             self.assertEqual(rows[2]["date"], date(2023, 12, 26))
             self.assertIsNone(rows[0]["return_pct"])
             self.assertIsNone(rows[0]["volume_vs_prior_20d"])
             self.assertEqual(rows[2]["return_pct"], 10.0)
             self.assertTrue(rows[0]["news_coverage_pass"])
             self.assertEqual(rows[0]["news_coverage_start"], date(2023, 12, 21))
-            self.assertFalse(rows[-1]["news_coverage_pass"])
+            self.assertTrue(rows[-1]["news_coverage_pass"])
             news = parquet.read_table(output / "news_events.parquet")
             events = news.drop(["published_at_utc"]).to_pylist()
             self.assertEqual(events[0]["title"], "Good, news")
@@ -144,7 +194,7 @@ class PreparationTests(unittest.TestCase):
             range_output = root / "range-out"
             range_report = prepare(root, range_output, start_date=date(2023, 12, 26), end_date=date(2023, 12, 26), coverage=SMALL_COVERAGE)
             self.assertEqual(range_report["retained_tickers"], [])
-            self.assertEqual(parquet.read_table(range_output / "daily_prices.parquet").num_rows, 2)
+            self.assertEqual(parquet.read_table(range_output / "daily_prices.parquet").num_rows, 0)
             self.assertEqual(parquet.read_table(range_output / "news_events.parquet").num_rows, 0)
 
             boundary_output = root / "boundary-out"
@@ -186,14 +236,14 @@ class PreparationTests(unittest.TestCase):
             )
             with (folder.parent / "nasdaq_exteral_data.csv").open("w", newline="", encoding="utf-8") as target:
                 writer = csv.writer(target)
-                writer.writerow(["Date", "Article_title", "Stock_symbol", "Url", "Publisher"])
-                writer.writerow(["2020-12-31 14:00:00 UTC", "Year end", " new ", "", ""])
-                writer.writerow(["2020-12-31 14:00:00 UTC", "Year end", "NEW", "", ""])
-                writer.writerow(["2020-12-31 15:00:00 UTC", "", "NEW", "u1", "Test"])
-                writer.writerow(["2020-12-29 14:00:00 UTC", "Before prices", "NEW", "u2", "Test"])
-                writer.writerow(["2020-12-31 14:00:00 UTC", "Unmatched", "UNKNOWN", "u3", "Test"])
+                writer.writerow(["Date", "Article_title", "Stock_symbol", "Url", "Publisher", "Article"])
+                writer.writerow(["2020-12-31 14:00:00 UTC", "Year end", " new ", "", "", ""])
+                writer.writerow(["2020-12-31 14:00:00 UTC", "Year end", "NEW", "", "", ""])
+                writer.writerow(["2020-12-31 15:00:00 UTC", "", "NEW", "u1", "Test", ""])
+                writer.writerow(["2020-12-29 14:00:00 UTC", "Before prices", "NEW", "u2", "Test", ""])
+                writer.writerow(["2020-12-31 14:00:00 UTC", "Unmatched", "UNKNOWN", "u3", "Test", ""])
             output = root / "out"
-            report = prepare(root, output, start_date=date(2020, 1, 1), end_date=date(2020, 12, 31), coverage=SMALL_COVERAGE)
+            report = prepare(root, output, start_date=date(2020, 12, 1), end_date=date(2020, 12, 31), coverage=SMALL_COVERAGE)
             news = parquet.read_table(output / "news_events.parquet")
             events = news.drop(["published_at_utc"]).to_pylist()
             self.assertEqual(len(events), 1)
@@ -270,9 +320,22 @@ class PreparationTests(unittest.TestCase):
                 {"max_empty_months": -1}, {"covered_month_fraction": 0}, {"covered_month_fraction": 1.1},
             ):
                 with self.subTest(overrides=overrides):
-                    config_path.write_text(json.dumps({"coverage": overrides}), encoding="utf-8")
+                    config_path.write_text(json.dumps({"start_date": "2015-01-01", "end_date": "2020-12-31", "coverage": overrides}), encoding="utf-8")
                     with self.assertRaises(ValueError):
                         load_config(config_path, root)
+
+    def test_invalid_selection_limits_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            for name in ("max_tickers",):
+                for value in (0, -1, True, 1.5):
+                    with self.subTest(name=name, value=value):
+                        config_path.write_text(json.dumps({
+                            "start_date": "2015-01-01", "end_date": "2020-12-31", name: value,
+                        }), encoding="utf-8")
+                        with self.assertRaises(ValueError):
+                            load_config(config_path, root)
 
 
 if __name__ == "__main__":
