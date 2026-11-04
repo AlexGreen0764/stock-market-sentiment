@@ -69,6 +69,8 @@ Dates and numeric columns retain native types. Publication timestamps are UTC. R
 
 [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) evaluates each headline for its associated ticker with thinking disabled.
 
+Each input includes the target's name and security type from [config/securities.json](./config/securities.json), using identities for 2015–2020. Add entries if the selected tickers change; missing metadata stops scoring before the model loads. Reports record the prompt, examples, and target metadata.
+
 | Label | Score |
 | --- | --- |
 | `negative` | -1 |

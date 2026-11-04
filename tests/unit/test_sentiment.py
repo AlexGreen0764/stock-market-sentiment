@@ -28,6 +28,10 @@ EXAMPLES = {
     "Annual meeting scheduled": "neutral",
     "Profit fell": "negative",
 }
+SECURITIES = {
+    "ABC": {"target_name": "ABC Corporation", "security_type": "stock"},
+    "DEF": {"target_name": "DEF Equity Fund", "security_type": "ETF"},
+}
 
 
 def write_fixture(path: Path, titles: list[str], tickers: list[str] | None = None) -> None:
@@ -69,7 +73,10 @@ class SentimentTests(unittest.TestCase):
         torch_double = MagicMock()
         torch_double.isfinite.return_value.all.return_value = True
         with patch.dict("sys.modules", {"torch": torch_double}):
-            results = scorer.score([("ABC", "Longer headline"), ("DEF", "Short")])
+            results = scorer.score([
+                ("ABC", "ABC Corporation", "stock", "Longer headline"),
+                ("DEF", "DEF Equity Fund", "ETF", "Short"),
+            ])
         self.assertEqual([row["sentiment_label"] for row in results], ["positive", "negative"])
         for call in scorer.tokenizer.apply_chat_template.call_args_list:
             self.assertIs(call.kwargs["enable_thinking"], False)
@@ -77,21 +84,26 @@ class SentimentTests(unittest.TestCase):
             messages = call.args[0]
             self.assertEqual([message["role"] for message in messages], ["system"] + ["user", "assistant"] * 10 + ["user"])
             for message in messages[1::2]:
-                self.assertEqual(set(json.loads(message["content"])), {"target_ticker", "headline"})
+                self.assertEqual(set(json.loads(message["content"])), {
+                    "target_ticker", "target_name", "security_type", "headline",
+                })
             answers = [message["content"] for message in messages[2:-1:2]]
-            self.assertCountEqual(answers, list("AABBCCDDEE"))
-            self.assertNotEqual(answers, sorted(answers))
+            self.assertEqual(answers, list("DBECEAABEB"))
         calls = scorer.tokenizer.apply_chat_template.call_args_list
         self.assertEqual(calls[0].args[0][:-1], calls[1].args[0][:-1])
-        self.assertEqual(json.loads(calls[0].args[0][-1]["content"]), {"target_ticker": "ABC", "headline": "Longer headline"})
-        self.assertEqual(json.loads(calls[1].args[0][-1]["content"]), {"target_ticker": "DEF", "headline": "Short"})
+        self.assertEqual(json.loads(calls[0].args[0][-1]["content"]), {
+            "target_ticker": "ABC", "target_name": "ABC Corporation", "security_type": "stock", "headline": "Longer headline",
+        })
+        self.assertEqual(json.loads(calls[1].args[0][-1]["content"]), {
+            "target_ticker": "DEF", "target_name": "DEF Equity Fund", "security_type": "ETF", "headline": "Short",
+        })
         self.assertIs(scorer.model.call_args.kwargs["use_cache"], False)
         self.assertEqual(scorer.model.call_args.kwargs["logits_to_keep"], 1)
 
     @patch("stock_market_sentiment.sentiment.SLMScorer")
     def test_enrichment_preserves_rows_dates_and_replaces_legacy_scores(self, model_class):
         scorer = model_class.return_value
-        scorer.score.side_effect = lambda items: [summarize_label(EXAMPLES[title]) for _, title in items]
+        scorer.score.side_effect = lambda items: [summarize_label(EXAMPLES[title]) for *_, title in items]
         with tempfile.TemporaryDirectory() as temp:
             path, report_path = Path(temp) / "news.parquet", Path(temp) / "report.json"
             write_fixture(path, list(EXAMPLES))
@@ -100,7 +112,7 @@ class SentimentTests(unittest.TestCase):
             for name in ("sentiment_negative", "sentiment_neutral", "sentiment_positive"):
                 legacy = legacy.append_column(name, pa.array([0.1] * 3))
             parquet.write_table(legacy, path)
-            report = score_news(path, report_path)
+            report = score_news(path, report_path, SECURITIES)
             scored = parquet.read_table(path)
             self.assertEqual(scored.select(EVENT_SCHEMA.names).replace_schema_metadata(original.schema.metadata), original)
             self.assertEqual(scored.column("sentiment_label").to_pylist(), ["positive", "neutral", "negative"])
@@ -112,6 +124,9 @@ class SentimentTests(unittest.TestCase):
             self.assertEqual(scored.schema.metadata[b"sentiment_thinking_enabled"], b"false")
             self.assertEqual(json.loads(scored.schema.metadata[b"sentiment_few_shot_messages"]), FEW_SHOT_MESSAGES)
             self.assertEqual(report["few_shot_messages"], FEW_SHOT_MESSAGES)
+            self.assertEqual(report["model_input_fields"], ["target_ticker", "target_name", "security_type", "headline"])
+            self.assertEqual(report["target_securities"], {"ABC": SECURITIES["ABC"]})
+            self.assertEqual(json.loads(scored.schema.metadata[b"sentiment_target_securities"]), report["target_securities"])
             self.assertFalse(report["thinking_enabled"])
             self.assertEqual(report["model_input_mode"], "text_only")
             self.assertEqual(report["rows_scored"], 3)
@@ -119,7 +134,7 @@ class SentimentTests(unittest.TestCase):
             self.assertEqual(report["mean_sentiment_score"], 0)
             self.assertEqual(report["headline_inferences"], 3)
             self.assertEqual(sum(report["label_counts"].values()), 3)
-            score_news(path, report_path)
+            score_news(path, report_path, SECURITIES)
             for field in SENTIMENT_SCHEMA:
                 self.assertEqual(parquet.read_schema(path).names.count(field.name), 1)
 
@@ -127,13 +142,16 @@ class SentimentTests(unittest.TestCase):
     def test_same_title_for_different_tickers_is_scored_separately(self, model_class):
         scorer = model_class.return_value
         scorer.score.side_effect = lambda items: [
-            summarize_label("positive" if ticker == "ABC" else "negative") for ticker, _ in items
+            summarize_label("positive" if ticker == "ABC" else "negative") for ticker, *_ in items
         ]
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "news.parquet"
             write_fixture(path, ["A wins business from B"] * 3, ["ABC", "DEF", "ABC"])
-            report = score_news(path, Path(temp) / "report.json")
-            self.assertEqual(scorer.score.call_args.args[0], [("ABC", "A wins business from B"), ("DEF", "A wins business from B")])
+            report = score_news(path, Path(temp) / "report.json", SECURITIES)
+            self.assertEqual(scorer.score.call_args.args[0], [
+                ("ABC", "ABC Corporation", "stock", "A wins business from B"),
+                ("DEF", "DEF Equity Fund", "ETF", "A wins business from B"),
+            ])
             self.assertEqual(report["headline_inferences"], 2)
             self.assertEqual(parquet.read_table(path).column("sentiment_score").to_pylist(), [1, -1, 1])
 
@@ -145,7 +163,7 @@ class SentimentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "news.parquet"
             write_fixture(path, ["Mixed evidence", "Roundup"])
-            report = score_news(path, Path(temp) / "report.json")
+            report = score_news(path, Path(temp) / "report.json", SECURITIES)
             self.assertEqual(report["numeric_score_rows"], 0)
             self.assertIsNone(report["mean_sentiment_score"])
             self.assertEqual(parquet.read_table(path).column("sentiment_score").to_pylist(), [None, None])
@@ -162,7 +180,7 @@ class SentimentTests(unittest.TestCase):
             original = path.read_bytes()
             report_path.write_text("previous report", encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "Model failure"):
-                score_news(path, report_path)
+                score_news(path, report_path, SECURITIES)
             self.assertEqual(path.read_bytes(), original)
             self.assertEqual(report_path.read_text(), "previous report")
             self.assertEqual(sorted(file.name for file in Path(temp).iterdir()), ["news.parquet", "report.json"])
@@ -173,7 +191,27 @@ class SentimentTests(unittest.TestCase):
             path = Path(temp) / "news.parquet"
             write_fixture(path, [])
             with self.assertRaisesRegex(ValueError, "empty"):
-                score_news(path, Path(temp) / "report.json")
+                score_news(path, Path(temp) / "report.json", SECURITIES)
+            model_class.assert_not_called()
+
+    @patch("stock_market_sentiment.sentiment.SLMScorer")
+    def test_security_metadata_is_required_before_model_loading(self, model_class):
+        """Reject incomplete identities without filtering rows or replacing scored data."""
+        cases = (
+            ({}, "Missing security metadata for: ABC"),
+            ({"ABC": {"security_type": "stock"}}, "nonempty target_name and security_type"),
+            ({"ABC": {"target_name": "ABC Corporation", "security_type": " "}}, "nonempty target_name and security_type"),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            path, report_path = Path(temp) / "news.parquet", Path(temp) / "report.json"
+            write_fixture(path, ["Annual meeting scheduled"])
+            original = path.read_bytes()
+            report_path.write_text("previous report", encoding="utf-8")
+            for securities, message in cases:
+                with self.subTest(securities=securities), self.assertRaisesRegex(ValueError, message):
+                    score_news(path, report_path, securities)
+                self.assertEqual(path.read_bytes(), original)
+                self.assertEqual(report_path.read_text(), "previous report")
             model_class.assert_not_called()
 
 
