@@ -1,5 +1,6 @@
 """Verify SLM label semantics, ticker-specific caching, and lossless file enrichment."""
 
+import json
 import tempfile
 import unittest
 from datetime import UTC, date, datetime
@@ -11,6 +12,7 @@ from pyarrow import parquet
 
 from stock_market_sentiment.prepare import EVENT_SCHEMA
 from stock_market_sentiment.sentiment import (
+    FEW_SHOT_MESSAGES,
     LABELS,
     MODEL_ID,
     MODEL_REVISION,
@@ -72,6 +74,17 @@ class SentimentTests(unittest.TestCase):
         for call in scorer.tokenizer.apply_chat_template.call_args_list:
             self.assertIs(call.kwargs["enable_thinking"], False)
             self.assertIs(call.kwargs["add_generation_prompt"], True)
+            messages = call.args[0]
+            self.assertEqual([message["role"] for message in messages], ["system"] + ["user", "assistant"] * 10 + ["user"])
+            for message in messages[1::2]:
+                self.assertEqual(set(json.loads(message["content"])), {"target_ticker", "headline"})
+            answers = [message["content"] for message in messages[2:-1:2]]
+            self.assertCountEqual(answers, list("AABBCCDDEE"))
+            self.assertNotEqual(answers, sorted(answers))
+        calls = scorer.tokenizer.apply_chat_template.call_args_list
+        self.assertEqual(calls[0].args[0][:-1], calls[1].args[0][:-1])
+        self.assertEqual(json.loads(calls[0].args[0][-1]["content"]), {"target_ticker": "ABC", "headline": "Longer headline"})
+        self.assertEqual(json.loads(calls[1].args[0][-1]["content"]), {"target_ticker": "DEF", "headline": "Short"})
         self.assertIs(scorer.model.call_args.kwargs["use_cache"], False)
         self.assertEqual(scorer.model.call_args.kwargs["logits_to_keep"], 1)
 
@@ -97,6 +110,8 @@ class SentimentTests(unittest.TestCase):
             self.assertEqual(scored.schema.metadata[b"sentiment_model"].decode(), MODEL_ID)
             self.assertEqual(scored.schema.metadata[b"sentiment_model_revision"].decode(), MODEL_REVISION)
             self.assertEqual(scored.schema.metadata[b"sentiment_thinking_enabled"], b"false")
+            self.assertEqual(json.loads(scored.schema.metadata[b"sentiment_few_shot_messages"]), FEW_SHOT_MESSAGES)
+            self.assertEqual(report["few_shot_messages"], FEW_SHOT_MESSAGES)
             self.assertFalse(report["thinking_enabled"])
             self.assertEqual(report["model_input_mode"], "text_only")
             self.assertEqual(report["rows_scored"], 3)

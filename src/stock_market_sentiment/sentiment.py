@@ -39,18 +39,28 @@ B=NEUTRAL: target-specific information without a directional implication.
 C=POSITIVE: material favorable implications for the target.
 D=MIXED: material favorable and adverse implications for the same target, neither clearly dominant.
 E=UNKNOWN: insufficient target-specific information to assess sentiment.
-Examples (ticker | headline => answer):
-AAPL | Apple cuts its earnings forecast => A
-WFC | Wells Fargo customers lose access during outage => A
-AAPL | Apple schedules annual shareholder meeting => B
-MSFT | Microsoft earnings preview: what to watch => B
-NVDA | Nvidia raises its revenue forecast => C
-AMZN | Amazon wins a major cloud contract => C
-MSFT | Microsoft revenue beats estimates but profit misses => D
-AMZN | Amazon sales rise but margins deteriorate sharply => D
-AAPL | Today's top stock upgrades and downgrades => E
-MSFT | Goldman Sachs upgrades Apple to buy => E
 Reply with exactly one answer letter A, B, C, D or E."""
+# Keep the shuffled order fixed across headlines and runs.
+FEW_SHOT_EXAMPLES = (
+    ("AMZN", "Amazon sales rise but margins deteriorate sharply", "D"),
+    ("MSFT", "Microsoft earnings preview: what to watch", "B"),
+    ("NVDA", "Nvidia raises its revenue forecast", "C"),
+    ("AAPL", "Today's top stock upgrades and downgrades", "E"),
+    ("WFC", "Wells Fargo customers lose access during outage", "A"),
+    ("AAPL", "Apple schedules annual shareholder meeting", "B"),
+    ("AMZN", "Amazon wins a major cloud contract", "C"),
+    ("MSFT", "Goldman Sachs upgrades Apple to buy", "E"),
+    ("AAPL", "Apple cuts its earnings forecast", "A"),
+    ("MSFT", "Microsoft revenue beats estimates but profit misses", "D"),
+)
+FEW_SHOT_MESSAGES = [
+    message
+    for ticker, title, answer in FEW_SHOT_EXAMPLES
+    for message in (
+        {"role": "user", "content": json.dumps({"target_ticker": ticker, "headline": title}, ensure_ascii=False)},
+        {"role": "assistant", "content": answer},
+    )
+]
 
 
 def summarize_label(label: str) -> dict:
@@ -101,6 +111,7 @@ class SLMScorer:
 
         prompts = [self.tokenizer.apply_chat_template([
             {"role": "system", "content": SYSTEM_PROMPT},
+            *FEW_SHOT_MESSAGES,
             {"role": "user", "content": json.dumps({"target_ticker": ticker, "headline": title}, ensure_ascii=False)},
         ], tokenize=False, add_generation_prompt=True, enable_thinking=False) for ticker, title in items]
         encoded = self.tokenizer(prompts, padding=False, add_special_tokens=False)
@@ -170,6 +181,7 @@ def score_news(path: Path, report_path: Path) -> dict:
                 b"sentiment_max_tokens": str(MAX_LENGTH).encode(),
                 b"sentiment_score_definition": SCORE_DEFINITION.encode(),
                 b"sentiment_system_prompt": SYSTEM_PROMPT.encode(),
+                b"sentiment_few_shot_messages": json.dumps(FEW_SHOT_MESSAGES, ensure_ascii=False).encode(),
                 b"sentiment_thinking_enabled": b"false",
                 b"sentiment_model_input_mode": b"text_only",
             }
@@ -216,6 +228,7 @@ def score_news(path: Path, report_path: Path) -> dict:
             "model": MODEL_ID, "model_revision": MODEL_REVISION,
             "input_file": str(path.resolve()), "input_columns": ["ticker", "title"], "max_tokens": MAX_LENGTH,
             "system_prompt": SYSTEM_PROMPT, "answer_method": "Highest next-token logit among A-E",
+            "few_shot_messages": FEW_SHOT_MESSAGES,
             "thinking_enabled": False, "model_input_mode": "text_only",
             "batch_size": BATCH_SIZE, "rows_scored": processed,
             "read_batch_size": READ_BATCH_SIZE, "headline_inferences": headline_inferences,
