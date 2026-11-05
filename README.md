@@ -65,6 +65,8 @@ Publication timestamps and dates are retained. Each article links to the first v
 
 Dates and numeric columns retain native types. Publication timestamps are UTC. Returns use adjusted close; volume ratios compare today's volume with the mean of up to 20 preceding sessions.
 
+See the [data preparation reference](./docs/data_preparation_reference.md) for report-count definitions, methodology, field types, and limitations.
+
 ## Sentiment
 
 [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) evaluates each headline for its associated ticker with thinking disabled.
