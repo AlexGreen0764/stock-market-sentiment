@@ -7,6 +7,8 @@ __pycache__/
 *.egg-info/
 # Large source data and reproducible pipeline outputs stay local.
 data/processed/
+data/interim/
 reports/
 nasdaq_exteral_data.csv
+symbols_valid_meta.csv
 full_history/

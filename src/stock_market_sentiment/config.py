@@ -1,11 +1,8 @@
-"""Load and validate preparation settings from JSON and CLI overrides.
-
-Sentiment inference uses fixed settings in its own module; these settings only
-control preparation. Configuration files remain standard, comment-free JSON.
-"""
+"""Load preparation settings and final sentiment-coverage selection rules."""
 
 from __future__ import annotations
 
+import argparse
 import json
 from dataclasses import dataclass
 from datetime import date
@@ -30,6 +27,14 @@ class CoverageThresholds:
 
 
 @dataclass(frozen=True)
+class SentimentCoverageThresholds:
+    """Require numeric sentiment depth across all configured publication months."""
+
+    articles_per_month: int = 10
+    covered_month_fraction: float = 0.8
+
+
+@dataclass(frozen=True)
 class PreparationConfig:
     """Immutable run settings with parsed dates and a resolved output path."""
 
@@ -38,6 +43,7 @@ class PreparationConfig:
     output: Path
     coverage: CoverageThresholds
     max_tickers: int
+    sentiment_coverage: SentimentCoverageThresholds = SentimentCoverageThresholds()
 
 
 def _parse_date(value: Any, field_name: str) -> date:
@@ -51,21 +57,7 @@ def _parse_date(value: Any, field_name: str) -> date:
 
 
 def load_config(path: Path, root: Path, overrides: dict[str, Any] | None = None) -> PreparationConfig:
-    """Load preparation settings and apply explicitly supplied CLI overrides.
-
-    Args:
-        path: Required JSON configuration file.
-        root: Base directory for a relative output path.
-        overrides: CLI values; None entries leave configured values unchanged.
-
-    Returns:
-        Immutable settings with inclusive date bounds and validated thresholds.
-
-    Raises:
-        TypeError: The top-level JSON or coverage section is not an object.
-        ValueError: Dates, threshold names, or threshold values are invalid.
-        OSError: The file cannot be read.
-    """
+    """Validate JSON settings, apply non-None CLI overrides and resolve output."""
     with path.open(encoding="utf-8") as source:
         values = json.load(source)
     if not isinstance(values, dict):
@@ -79,12 +71,9 @@ def load_config(path: Path, root: Path, overrides: dict[str, Any] | None = None)
     if start_date > end_date:
         raise ValueError("start_date must be on or before end_date")
 
-    limits = {name: values.get(name, default) for name, default in (
-        ("max_tickers", 30),
-    )}
-    for name, value in limits.items():
-        if type(value) is not int or value < 1:
-            raise ValueError(f"{name} must be a positive integer")
+    max_tickers = values.get("max_tickers", 30)
+    if type(max_tickers) is not int or max_tickers < 1:
+        raise ValueError("max_tickers must be a positive integer")
 
     raw_coverage = values.get("coverage", {})
     if not isinstance(raw_coverage, dict):
@@ -103,6 +92,19 @@ def load_config(path: Path, root: Path, overrides: dict[str, Any] | None = None)
     if type(coverage.covered_month_fraction) not in (int, float) or not 0 < coverage.covered_month_fraction <= 1:
         raise ValueError("coverage.covered_month_fraction must be greater than 0 and at most 1")
 
+    raw_sentiment = values.get("sentiment_coverage", {})
+    if not isinstance(raw_sentiment, dict):
+        raise TypeError("sentiment_coverage must be an object")
+    unknown = set(raw_sentiment) - set(SentimentCoverageThresholds.__dataclass_fields__)
+    if unknown:
+        raise ValueError(f"Unknown sentiment_coverage settings: {', '.join(sorted(unknown))}")
+    sentiment_coverage = SentimentCoverageThresholds(**raw_sentiment)
+    if type(sentiment_coverage.articles_per_month) is not int or sentiment_coverage.articles_per_month < 1:
+        raise ValueError("sentiment_coverage.articles_per_month must be a positive integer")
+    if (type(sentiment_coverage.covered_month_fraction) not in (int, float)
+            or not 0 < sentiment_coverage.covered_month_fraction <= 1):
+        raise ValueError("sentiment_coverage.covered_month_fraction must be greater than 0 and at most 1")
+
     output = Path(values.get("output", "data/processed"))
     if not output.is_absolute():
         output = root / output
@@ -111,5 +113,27 @@ def load_config(path: Path, root: Path, overrides: dict[str, Any] | None = None)
         end_date=end_date,
         output=output,
         coverage=coverage,
-        **limits,
+        sentiment_coverage=sentiment_coverage,
+        max_tickers=max_tickers,
     )
+
+
+def parse_config_args(description: str) -> tuple[Path, PreparationConfig]:
+    """Use the same repository paths and overrides for preparation and scoring."""
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
+    parser.add_argument("--config", type=Path, help="JSON configuration file")
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--start-date")
+    parser.add_argument("--end-date")
+    args = parser.parse_args()
+    root = args.root.resolve()
+    try:
+        config = load_config(args.config or root / "config" / "default.json", root, {
+            "start_date": args.start_date,
+            "end_date": args.end_date,
+            "output": args.output,
+        })
+    except (TypeError, ValueError, OSError, json.JSONDecodeError) as error:
+        parser.error(str(error))
+    return root, config

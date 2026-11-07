@@ -22,8 +22,11 @@ Place the source files at:
 
 - `data/raw/full_history/`: one price CSV per ticker.
 - `data/raw/nasdaq_exteral_data.csv`: news export.
+- `data/raw/symbols_valid_meta.csv`: security names and stock/ETF types, with `Symbol`, `Security Name`, and `ETF` (`Y`/`N`) columns. The [2020 Stock Market Dataset](https://www.kaggle.com/datasets/jacksoncrow/stock-market-dataset?select=symbols_valid_meta.csv) provides this file.
 
-Raw data, processed data, and reports are excluded from Git.
+The catalog is the sole source of target names and security types. Its snapshot does not resolve historical symbol changes.
+
+Raw data, intermediate files, processed data, and reports are excluded from Git.
 
 ## Run the pipeline
 
@@ -34,11 +37,17 @@ Run preparation first, then sentiment scoring:
 .\.venv\Scripts\python.exe -m stock_market_sentiment.sentiment
 ```
 
-Preparation overwrites the news output, so rerun sentiment scoring after rebuilding the dataset. The scorer reads `data/processed/news_events.parquet` independently of preparation settings and enriches it in place.
+Preparation cleans and ranks eligible candidates into `data/interim/prepared/<ticker>/` and records preparation counts in `data/interim/manifest.json`.
+
+Sentiment scoring visits complete tickers in that order until 30 qualify or candidates are exhausted. The model loads once when inference is needed. It publishes matching news/price universes and reports after selection, keeping null-scored articles. A smaller qualifying set is exported if candidates run out; zero qualifiers preserves existing final outputs and raises an error.
+
+Rerun the second command to resume. Completed ticker scores are reused when candidate content, model, prompt and target identity match. Changing final coverage thresholds alone does not repeat inference.
+
+Both commands accept `--root`, `--config`, `--output`, `--start-date` and `--end-date`. Use matching preparation settings. Rebuild candidates when raw data, dates or cleaning rules change; rerun sentiment when the prompt or final coverage thresholds change.
 
 ## Dataset scope
 
-Defaults in [config/default.json](./config/default.json) select up to **30 tickers** during **2015–2020**. Coverage is measured after article deduplication and price matching.
+Defaults in [config/default.json](./config/default.json) aim for **30 tickers** during **2015–2020**. The first screen uses news coverage after article deduplication and price matching.
 
 | Coverage criterion | Minimum or limit |
 | --- | --- |
@@ -48,7 +57,9 @@ Defaults in [config/default.json](./config/default.json) select up to **30 ticke
 | Distinct publication dates | 60 |
 | Articles per ticker | 100 |
 
-Eligible tickers rank by covered months, then distinct publication dates, then ticker alphabetically. Both outputs use the selected ticker universe.
+Eligible tickers rank by covered months, then distinct publication dates, then ticker alphabetically.
+
+The final screen requires **at least 10 numeric sentiment ratings in at least 80% of all configured publication months**: at least **58 of 72 months** by default. Negative, neutral, and positive count; mixed and insufficient information do not. The first 30 candidates passing this screen form the final universe. These rules measure chart coverage, not model accuracy or market representativeness.
 
 Articles are deduplicated per ticker using URL, or publication timestamp and title when the URL is missing. Body text is excluded; articles associated with multiple tickers remain eligible.
 
@@ -60,8 +71,8 @@ Publication timestamps and dates are retained. Each article links to the first v
 | --- | --- |
 | `data/processed/daily_prices.parquet` | Daily OHLC prices, adjusted close, volume, return percentage, volume ratio, and coverage fields |
 | `data/processed/news_events.parquet` | Article–ticker records with publication dates, next trading date, headline, URL, publisher, and sentiment |
-| `reports/quality_report.json` | Preparation counts, validation results, and ticker coverage |
-| `reports/sentiment_report.json` | Model settings, label counts, and processing speed |
+| `reports/quality_report.json` | Preparation counts, validation results, and final ticker selection |
+| `reports/sentiment_report.json` | Model settings, label counts, candidate sentiment coverage, and processing statistics |
 
 Dates and numeric columns retain native types. Publication timestamps are UTC. Returns use adjusted close; volume ratios compare today's volume with the mean of up to 20 preceding sessions.
 
@@ -71,7 +82,9 @@ See the [data preparation reference](./docs/data_preparation_reference.md) for r
 
 [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) evaluates each headline for its associated ticker with thinking disabled.
 
-Each input includes the target's name and security type from [config/securities.json](./config/securities.json), using identities for 2015–2020. Add entries if the selected tickers change; missing metadata stops scoring before the model loads. Reports record the prompt, examples, and target metadata.
+Each input includes the target's name and security type. Reports and Parquet metadata record the inference settings and target identities.
+
+Five fixed examples guide classification. An unnamed, uniformly bullish or bearish stock/ETF recommendation can apply through the article–ticker association when its security type matches the target. Other-company news does not transfer to the target; fund flows do not transfer to holdings. Unresolved comparisons remain unknown. Recommendation membership is assumed, not verified from article bodies.
 
 | Label | Score |
 | --- | --- |
@@ -81,9 +94,18 @@ Each input includes the target's name and security type from [config/securities.
 | `mixed` | null |
 | `insufficient_information` | null |
 
-Scores are category codes; confidence values are not exported. Mixed means opposing material implications. Insufficient information means the headline lacks enough target-specific evidence.
+Scores are category codes; confidence values are not exported. Mixed means opposing material facts about the same target. Insufficient information means no applicable assertion under the attribution rules.
 
-Progress reports records scored, speed, and estimated time remaining after each 8,192-row chunk. Model loading and initial compilation precede the first update.
+Progress shows headline scoring and candidate acceptance.
+
+## Code layout
+
+| Module | Responsibility |
+| --- | --- |
+| [config.py](./src/stock_market_sentiment/config.py) | Settings validation and shared command arguments |
+| [prepare.py](./src/stock_market_sentiment/prepare.py) | Raw data cleaning, session matching and candidate preparation |
+| [sentiment.py](./src/stock_market_sentiment/sentiment.py) | Prompt, model inference and score mapping |
+| [pipeline.py](./src/stock_market_sentiment/pipeline.py) | Score reuse, final coverage selection and output publication |
 
 ## Power BI
 
@@ -98,3 +120,5 @@ The tickers form a coverage-selected sample. Sentiment and price movements show 
 ```
 
 Tests use temporary fixtures and model doubles without GPU inference or model downloads. See [source code](./src/stock_market_sentiment/) and [unit tests](./tests/unit/) for implementation details.
+
+The [prompt evaluation](./docs/sentiment_prompt_evaluation.md) records the bounded GPU comparisons and their limitations.

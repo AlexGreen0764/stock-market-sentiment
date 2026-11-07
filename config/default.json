@@ -3,6 +3,10 @@
   "end_date": "2020-12-31",
   "output": "data/processed",
   "max_tickers": 30,
+  "sentiment_coverage": {
+    "articles_per_month": 10,
+    "covered_month_fraction": 0.8
+  },
   "coverage": {
     "span_months": 24,
     "covered_month_fraction": 0.75,

@@ -1,14 +1,13 @@
-"""Clean raw OHLCV prices and news into typed Parquet tables for Power BI.
+"""Prepare and rank eligible ticker histories for adaptive sentiment selection.
 
-Both exports use the same small ticker universe, ranked by coverage across the
-configured window. Publication dates are UTC; reaction dates come from observed
-price sessions. Body text is not exported; sentiment is a separate stage.
+Candidate files stay in data/interim; scoring selects the final Power BI exports.
+Publication dates are UTC and reaction dates come from observed price sessions.
 """
 
 from __future__ import annotations
 
-import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -24,7 +23,7 @@ import pyarrow as pa
 from pyarrow import csv as arrow_csv
 from pyarrow import parquet
 
-from .config import CoverageThresholds, load_config
+from .config import CoverageThresholds, PreparationConfig, parse_config_args
 
 PRICE_COLUMNS = ("date", "open", "high", "low", "close", "adj close", "volume")
 PRICE_COUNT_KEYS = (
@@ -51,20 +50,10 @@ EVENT_SCHEMA = pa.schema([
 
 
 def load_prices(source_path: Path, counts: Counter, invalid_examples: dict[str, list[dict]]) -> list[dict]:
-    """Clean one price history and calculate returns and prior-volume ratios.
+    """Validate and sort one ticker's prices, retaining the first valid row per date.
 
-    Args:
-        source_path: CSV whose filename stem identifies the ticker.
-        counts: Mutable counters updated for accepted, invalid, and duplicate rows.
-        invalid_examples: Shared audit samples, capped at three rows per reason.
-
-    Returns:
-        Valid rows in ascending date order, with Python dates and integer volumes.
-        Each date retains its first valid input row.
-
-    Raises:
-        ValueError: The CSV lacks required price columns.
-        OSError: The source cannot be read.
+    Calculate features over full history; count rejections and retain up to three
+    examples per reason. Decimal parsing keeps large integral volumes exact.
     """
     ticker = source_path.stem.strip().upper()
     by_date = {}
@@ -146,9 +135,22 @@ def next_trading_day(article_day: date, trading_days: list[date]) -> date | None
     return session if (session - article_day).days <= 7 else None
 
 
-def in_date_range(day: date, start_date: date, end_date: date) -> bool:
-    """Test the configured inclusive publication or base price window."""
-    return start_date <= day <= end_date
+def match_articles(articles: list[dict], trading_days: list[date], counts: Counter) -> list[dict]:
+    """Link one ticker's articles to usable sessions, then remove duplicate records."""
+    events = []
+    seen = set()
+    for event in articles:
+        session = next_trading_day(event["article_date_utc"], trading_days)
+        if session is None:
+            counts["article_rows_unusable_price_match"] += 1
+            continue
+        key = event["url"] or (event["published_at_utc"], event["title"])
+        if key in seen:
+            counts["article_rows_duplicate"] += 1
+            continue
+        seen.add(key)
+        events.append({**event, "next_trading_date": session})
+    return events
 
 
 def coverage_by_ticker(
@@ -262,31 +264,26 @@ def load_articles(
     return articles
 
 
+def _write_candidate(path: Path, rows: list[dict], schema: pa.Schema) -> str:
+    """Commit one typed candidate file and return its exact content fingerprint."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial = path.with_name(path.name + ".partial")
+    try:
+        parquet.write_table(pa.Table.from_pylist(rows, schema=schema), partial)
+        with partial.open("rb") as source:
+            fingerprint = hashlib.file_digest(source, "sha256").hexdigest()
+        os.replace(partial, path)
+        return fingerprint
+    finally:
+        partial.unlink(missing_ok=True)
 
-def prepare(
-    root: Path,
-    output: Path,
-    start_date: date,
-    end_date: date,
-    coverage: CoverageThresholds | None = None,
-    max_tickers: int = 30,
-) -> dict:
-    """Select a fixed study universe and export its daily prices and article rows.
 
-    Coverage is evaluated after usable price-session matching and per-ticker
-    deduplication. Qualifiers rank by covered months,
-    distinct publication dates, then ticker alphabetically; sentiment never enters
-    selection. Price histories
-    are validated one at a time and reread for the small selected universe.
+def prepare(root: Path, config: PreparationConfig) -> dict:
+    """Clean and rank candidates; commit their preparation manifest last.
 
-    A failed build leaves existing data intact until replacement. Output files are
-    replaced individually, not as a multi-file transaction.
+    Final selection and production outputs belong to the sentiment stage.
     """
-    if start_date > end_date:
-        raise ValueError("start_date must be on or before end_date")
-    if type(max_tickers) is not int or max_tickers < 1:
-        raise ValueError("max_tickers must be a positive integer")
-    coverage = coverage or CoverageThresholds()
+    start_date, end_date, coverage = config.start_date, config.end_date, config.coverage
     source_files = sorted(path for path in (root / "data/raw/full_history").glob("*.csv") if path.is_file())
     price_files = {path.stem.strip().upper(): path for path in source_files}
     if len(price_files) != len(source_files):
@@ -304,7 +301,8 @@ def prepare(
     price_validation = {}
     price_ranges = {}
     invalid_price_examples = {}
-    eligible = {}
+    prepared_candidates = {}
+    interim = root / "data" / "interim"
     for ticker in tickers:
         price_counts = Counter()
         rows = load_prices(price_files[ticker], price_counts, invalid_price_examples)
@@ -314,84 +312,44 @@ def prepare(
         price_ranges[ticker] = {
             "first": trading_days[0].isoformat() if rows else None,
             "last": trading_days[-1].isoformat() if rows else None,
-            "input_rows": len(rows), "exported_rows": 0,
+            "input_rows": len(rows),
         }
-        events = []
-        seen = set()
-        for event in articles.pop(ticker, []):
-            session = next_trading_day(event["article_date_utc"], trading_days)
-            if session is None:
-                counts["article_rows_unusable_price_match"] += 1
-                continue
-            key = event["url"] or (event["published_at_utc"], event["title"])
-            if key in seen:
-                counts["article_rows_duplicate"] += 1
-                continue
-            seen.add(key)
-            event["next_trading_date"] = session
-            events.append(event)
+        events = match_articles(articles.pop(ticker, []), trading_days, counts)
         metrics = coverage_by_ticker(events, [ticker], coverage, start_date, end_date)[ticker]
         coverage_summary[ticker] = metrics
         counts["article_rows_before_coverage"] += len(events)
         if metrics["passes"]:
-            eligible[ticker] = events
-    ranked = sorted(eligible, key=lambda ticker: (
+            linked = {event["next_trading_date"] for event in events}
+            prepared_prices = []
+            for row in rows:
+                if start_date <= row["date"] <= end_date or row["date"] in linked:
+                    row.update(
+                        news_coverage_pass=True,
+                        news_coverage_start=date.fromisoformat(metrics["coverage_start"]),
+                        news_coverage_end=date.fromisoformat(metrics["coverage_end"]),
+                    )
+                    prepared_prices.append(row)
+            folder = interim / "prepared" / ticker
+            prepared_candidates[ticker] = {
+                "news_sha256": _write_candidate(folder / "news.parquet", events, EVENT_SCHEMA),
+                "prices_sha256": _write_candidate(folder / "prices.parquet", prepared_prices, PRICE_SCHEMA),
+                "article_rows": len(events), "price_rows": len(prepared_prices),
+            }
+    ranked = sorted(prepared_candidates, key=lambda ticker: (
         -coverage_summary[ticker]["covered_months"],
         -coverage_summary[ticker]["distinct_publication_dates"], ticker,
     ))
-    retained_tickers = sorted(ranked[:max_tickers])
-    # Release metadata for qualifying tickers outside the selected study universe.
-    selected = {ticker: eligible[ticker] for ticker in retained_tickers}
-    del eligible
-    selected_events = [event for ticker in retained_tickers for event in selected[ticker]]
-    output.mkdir(parents=True, exist_ok=True)
-    price_path = output / "daily_prices.parquet.partial"
-    news_path = output / "news_events.parquet.partial"
-    try:
-        with parquet.ParquetWriter(price_path, PRICE_SCHEMA) as price_writer, parquet.ParquetWriter(
-            news_path, EVENT_SCHEMA
-        ) as news_writer:
-            for ticker in retained_tickers:
-                events = selected[ticker]
-                news_writer.write_table(pa.Table.from_pylist(events, schema=EVENT_SCHEMA))
-                counts["article_rows_kept"] += len(events)
-                counts["article_rows_kept_missing_publisher"] += sum(not event["has_publisher"] for event in events)
-                counts["article_rows_kept_missing_url"] += sum(not event["has_url"] for event in events)
-                linked = {event["next_trading_date"] for event in events}
-                rows = load_prices(price_files[ticker], Counter(), {})
-                metrics = coverage_summary[ticker]
-                selected_rows = []
-                for row in rows:
-                    if in_date_range(row["date"], start_date, end_date) or row["date"] in linked:
-                        row.update(
-                            news_coverage_pass=True,
-                            news_coverage_start=date.fromisoformat(metrics["coverage_start"]),
-                            news_coverage_end=date.fromisoformat(metrics["coverage_end"]),
-                        )
-                        selected_rows.append(row)
-                price_writer.write_table(pa.Table.from_pylist(selected_rows, schema=PRICE_SCHEMA))
-                counts["price_rows_kept"] += len(selected_rows)
-                price_ranges[ticker]["exported_rows"] = len(selected_rows)
-        os.replace(price_path, output / "daily_prices.parquet")
-        os.replace(news_path, output / "news_events.parquet")
-    finally:
-        price_path.unlink(missing_ok=True)
-        news_path.unlink(missing_ok=True)
-    annual = Counter()
-    annual_tickers = Counter()
-    for ticker in retained_tickers:
-        annual.update(coverage_summary[ticker]["articles_by_year"])
-        annual_tickers.update(coverage_summary[ticker]["articles_by_year"].keys())
-    kept = counts["article_rows_kept"]
     report = {
-        "candidate_tickers": tickers, "price_tickers": retained_tickers,
-        "retained_tickers": retained_tickers,
+        "prepared_candidates": prepared_candidates,
+        "prepared_counts": {
+            "news_rows": sum(candidate["article_rows"] for candidate in prepared_candidates.values()),
+            "price_rows": sum(candidate["price_rows"] for candidate in prepared_candidates.values()),
+        },
+        "candidate_tickers": tickers,
         "rejected_tickers": [ticker for ticker in tickers if not coverage_summary[ticker]["passes"]],
         "qualified_tickers": sorted(ranked),
-        "qualified_but_not_selected": sorted(set(ranked) - set(retained_tickers)),
         "ticker_ranking": ranked,
         "selection": {
-            "max_tickers": max_tickers,
             "ranking_rule": "Covered months descending, distinct publication dates descending, ticker ascending",
             "article_identity": "Exact stripped URL within ticker, or publication timestamp and title when URL is missing",
             "coverage_window": "All configured months, including leading and trailing gaps",
@@ -400,63 +358,28 @@ def prepare(
         "article_filter_counts_by_ticker": {ticker: dict(ticker_counts[ticker]) for ticker in tickers},
         "price_validation_by_ticker": price_validation, "invalid_price_examples": invalid_price_examples,
         "price_date_ranges": price_ranges,
-        "retained_news_quality": {
-            "article_ticker_records": kept,
-            "missing_publisher": counts["article_rows_kept_missing_publisher"],
-            "missing_publisher_fraction": counts["article_rows_kept_missing_publisher"] / kept if kept else None,
-            "missing_url": counts["article_rows_kept_missing_url"],
-        },
-        "retained_news_by_year": {
-            year: {"article_ticker_records": total, "tickers_with_articles": annual_tickers[year]}
-            for year, total in sorted(annual.items())
-        },
-        "retained_news_by_month": dict(sorted(Counter(
-            event["article_date_utc"].strftime("%Y-%m") for event in selected_events
-        ).items())),
         "counts": {key: counts[key] for key in (
-            *PRICE_COUNT_KEYS, "price_rows_kept", "article_rows_read", "article_rows_selected",
+            *PRICE_COUNT_KEYS, "article_rows_read", "article_rows_selected",
             "article_rows_unmatched_ticker", "article_rows_invalid_date", "article_rows_missing_title",
             "article_rows_missing_url", "article_rows_missing_publisher", "article_rows_duplicate",
             "article_rows_unusable_price_match", "article_rows_outside_date_range",
-            "article_rows_before_coverage", "article_rows_kept",
-            "article_rows_kept_missing_publisher", "article_rows_kept_missing_url",
+            "article_rows_before_coverage",
         )},
         "start_date": start_date.isoformat(), "end_date": end_date.isoformat(),
         "news_link_rule": "First observed session strictly after the UTC publication date, within 7 calendar days; pre-history articles excluded. Linked sessions may extend beyond end_date.",
     }
-    report_dir = root / "reports"
-    report_dir.mkdir(parents=True, exist_ok=True)
-    report_path = report_dir / "quality_report.json.partial"
-    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    os.replace(report_path, report_dir / "quality_report.json")
+    interim.mkdir(parents=True, exist_ok=True)
+    manifest_partial = interim / "manifest.json.partial"
+    try:
+        manifest_partial.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        os.replace(manifest_partial, interim / "manifest.json")
+    finally:
+        manifest_partial.unlink(missing_ok=True)
     return report
 
 
-
 def main() -> None:
-    """Apply preparation CLI overrides and print the generated audit as JSON."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
-    parser.add_argument("--config", type=Path, help="JSON configuration file")
-    parser.add_argument("--output", type=Path)
-    parser.add_argument("--start-date")
-    parser.add_argument("--end-date")
-    args = parser.parse_args()
-    config_path = args.config or args.root / "config" / "default.json"
-    try:
-        config = load_config(config_path, args.root, {
-            "start_date": args.start_date,
-            "end_date": args.end_date,
-            "output": args.output,
-        })
-    except (TypeError, ValueError, OSError, json.JSONDecodeError) as error:
-        parser.error(str(error))
-    report = prepare(
-        args.root,
-        config.output,
-        config.start_date,
-        config.end_date,
-        config.coverage,
-        config.max_tickers,
-    )
-    print(json.dumps(report, indent=2))
+    """Prepare all candidates and print a concise manifest summary."""
+    root, config = parse_config_args(__doc__)
+    report = prepare(root, config)
+    print(f"Prepared {len(report['ticker_ranking']):,} candidates; manifest: {root / 'data/interim/manifest.json'}")

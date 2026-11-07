@@ -1,17 +1,25 @@
 """Focused checks for CSV parsing, price validation, and news alignment."""
 
 import csv
+import hashlib
 import json
 import tempfile
 import unittest
 from collections import Counter
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from unittest.mock import patch
 
 from pyarrow import parquet
 
-from stock_market_sentiment.config import CoverageThresholds, load_config
+from stock_market_sentiment.config import (
+    CoverageThresholds,
+    PreparationConfig,
+    SentimentCoverageThresholds,
+    load_config,
+    parse_config_args,
+)
 from stock_market_sentiment.prepare import (
     coverage_by_ticker,
     load_prices,
@@ -20,7 +28,7 @@ from stock_market_sentiment.prepare import (
     prepare,
 )
 
-# Tiny fixtures exercise export behavior without relaxing production defaults.
+# Tiny fixtures exercise candidate preparation without changing production defaults.
 SMALL_COVERAGE = CoverageThresholds(span_months=1, covered_month_fraction=1, max_empty_months=0, distinct_publication_dates=1, articles=1)
 
 
@@ -28,7 +36,7 @@ class PreparationTests(unittest.TestCase):
     """Exercise cleaning and coverage rules using isolated temporary inputs."""
     def test_package_entry_point_finds_repository_config(self):
         with patch("sys.argv", ["stock-market-sentiment"]), patch(
-            "stock_market_sentiment.prepare.prepare", return_value={}
+            "stock_market_sentiment.prepare.prepare", return_value={"ticker_ranking": []}
         ) as mocked:
             main()
         root = mocked.call_args.args[0]
@@ -41,6 +49,7 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(config.end_date, date(2020, 12, 31))
         self.assertEqual(config.max_tickers, 30)
         self.assertEqual(config.coverage, CoverageThresholds(24, 0.75, 3, 60, 100))
+        self.assertEqual(config.sentiment_coverage, SentimentCoverageThresholds(10, 0.8))
 
     def test_monthly_coverage_requires_continuity_depth_and_distinct_days(self):
         events = []
@@ -90,7 +99,7 @@ class PreparationTests(unittest.TestCase):
         self.assertIn("covered_month_fraction", result["failed_criteria"])
         self.assertIn("max_empty_months", result["failed_criteria"])
 
-    def test_broad_articles_retained_and_top_ticker_selected(self):
+    def test_all_eligible_candidates_ranked_without_replacing_final_outputs(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             folder = root / "data/raw/full_history"
@@ -121,13 +130,34 @@ class PreparationTests(unittest.TestCase):
                 for ticker in ("ABC", "OUT1", "OUT2", "OUT3", "OUT4", "OUT4"):
                     published = "2023-12-22" if ticker == "ABC" else "2000-01-01"
                     writer.writerow([f"{published} 14:00:00 UTC", "At cap", ticker, "at-cap", "Test", "Preserved"])
-            report = prepare(root, root / "out", date(2023, 12, 1), date(2023, 12, 31), SMALL_COVERAGE, max_tickers=1)
-            self.assertEqual(report["retained_tickers"], ["ABC"])
+            output = root / "out"
+            output.mkdir()
+            reports = root / "reports"
+            reports.mkdir()
+            preserved = [output / "news_events.parquet", output / "daily_prices.parquet",
+                         reports / "quality_report.json", reports / "sentiment_report.json"]
+            for path in preserved:
+                path.write_bytes(b"Existing final result")
+            config = PreparationConfig(date(2023, 12, 1), date(2023, 12, 31), output, SMALL_COVERAGE, 1)
+            with patch("stock_market_sentiment.prepare.load_prices", wraps=load_prices) as loader:
+                report = prepare(root, config)
+            self.assertEqual(loader.call_count, 3)
+            self.assertNotIn("retained_tickers", report)
             self.assertEqual(report["ticker_ranking"], ["ABC", "XYZ", "DEF"])
-            self.assertEqual(report["qualified_but_not_selected"], ["DEF", "XYZ"])
-            news = parquet.read_table(root / "out/news_events.parquet", columns=["title"]).to_pylist()
+            self.assertEqual(set(report["prepared_candidates"]), {"ABC", "DEF", "XYZ"})
+            self.assertNotIn("max_tickers", report["selection"])
+            self.assertEqual(report["prepared_counts"], {"news_rows": 13, "price_rows": 12})
+            for ticker, candidate in report["prepared_candidates"].items():
+                for name, fingerprint in (("news", "news_sha256"), ("prices", "prices_sha256")):
+                    path = root / "data/interim/prepared" / ticker / f"{name}.parquet"
+                    self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), candidate[fingerprint])
+            for path in preserved:
+                self.assertEqual(path.read_bytes(), b"Existing final result")
+            manifest = json.loads((root / "data/interim/manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["ticker_ranking"], ["ABC", "XYZ", "DEF"])
+            news = parquet.read_table(root / "data/interim/prepared/ABC/news.parquet", columns=["title"]).to_pylist()
             self.assertEqual([row["title"] for row in news], ["Item 0", "Item 1", "Item 2", "Broad", "At cap"])
-            prices = parquet.read_table(root / "out/daily_prices.parquet", columns=["ticker"]).to_pylist()
+            prices = parquet.read_table(root / "data/interim/prepared/ABC/prices.parquet", columns=["ticker"]).to_pylist()
             self.assertEqual({row["ticker"] for row in prices}, {"ABC"})
 
     def test_pipeline_reads_reordered_prices_and_multiline_news(self):
@@ -156,19 +186,24 @@ class PreparationTests(unittest.TestCase):
                 writer.writerow(["2023-12-21 14:00:00 UTC", "Earlier", "ABC", "https://example.test/3", "Test", "Prior publication date"])
                 writer.writerow(["2023-12-22 14:00:00 UTC", "Sparse", "DEF", "https://example.test/4", "Test", "One article"])
             output = root / "out"
-            report = prepare(root, output, date(2023, 12, 1), date(2023, 12, 31), CoverageThresholds(1, 1, 0, 2, 2))
+            config = PreparationConfig(date(2023, 12, 1), date(2023, 12, 31), output,
+                                       CoverageThresholds(1, 1, 0, 2, 2), 30)
+            report = prepare(root, config)
             self.assertEqual(report["counts"]["price_rows_invalid"], 1)
             self.assertEqual(report["counts"]["price_rows_duplicate_date"], 1)
-            self.assertEqual(report["counts"]["article_rows_kept"], 2)
+            self.assertNotIn("article_rows_kept", report["counts"])
+            self.assertEqual(report["prepared_counts"]["news_rows"], 2)
             self.assertEqual(report["counts"]["article_rows_duplicate"], 1)
-            self.assertEqual(report["retained_tickers"], ["ABC"])
+            self.assertEqual(report["ticker_ranking"], ["ABC"])
             self.assertEqual(report["rejected_tickers"], ["DEF"])
             self.assertEqual(report["candidate_tickers"], ["ABC", "DEF"])
-            self.assertEqual(report["price_tickers"], ["ABC"])
-            self.assertEqual(report["counts"]["price_rows_kept"], 3)
-            self.assertEqual(sorted(path.name for path in output.iterdir()), ["daily_prices.parquet", "news_events.parquet"])
-            self.assertTrue((root / "reports" / "quality_report.json").is_file())
-            rows = parquet.read_table(output / "daily_prices.parquet").to_pylist()
+            self.assertNotIn("price_tickers", report)
+            self.assertNotIn("price_rows_kept", report["counts"])
+            self.assertEqual(report["prepared_counts"]["price_rows"], 3)
+            self.assertFalse(output.exists())
+            self.assertFalse((root / "reports").exists())
+            candidate = root / "data/interim/prepared/ABC"
+            rows = parquet.read_table(candidate / "prices.parquet").to_pylist()
             self.assertEqual({row["ticker"] for row in rows}, {"ABC"})
             self.assertEqual(rows[2]["date"], date(2023, 12, 26))
             self.assertIsNone(rows[0]["return_pct"])
@@ -177,7 +212,7 @@ class PreparationTests(unittest.TestCase):
             self.assertTrue(rows[0]["news_coverage_pass"])
             self.assertEqual(rows[0]["news_coverage_start"], date(2023, 12, 21))
             self.assertTrue(rows[-1]["news_coverage_pass"])
-            news = parquet.read_table(output / "news_events.parquet")
+            news = parquet.read_table(candidate / "news.parquet")
             events = news.drop(["published_at_utc"]).to_pylist()
             self.assertEqual(events[0]["title"], "Good, news")
             self.assertEqual(
@@ -186,24 +221,28 @@ class PreparationTests(unittest.TestCase):
             )
             self.assertEqual(events[0]["article_date_utc"], date(2023, 12, 22))
             self.assertEqual(events[0]["next_trading_date"], date(2023, 12, 26))
-            news_schema = parquet.read_schema(output / "news_events.parquet")
+            news_schema = parquet.read_schema(candidate / "news.parquet")
             self.assertEqual(str(news_schema.field("article_date_utc").type), "date32[day]")
             self.assertEqual(str(news_schema.field("next_trading_date").type), "date32[day]")
             self.assertEqual(str(news_schema.field("published_at_utc").type), "timestamp[ms, tz=UTC]")
 
             range_output = root / "range-out"
-            range_report = prepare(root, range_output, start_date=date(2023, 12, 26), end_date=date(2023, 12, 26), coverage=SMALL_COVERAGE)
-            self.assertEqual(range_report["retained_tickers"], [])
-            self.assertEqual(parquet.read_table(range_output / "daily_prices.parquet").num_rows, 0)
-            self.assertEqual(parquet.read_table(range_output / "news_events.parquet").num_rows, 0)
+            range_report = prepare(root, replace(config, output=range_output, start_date=date(2023, 12, 26),
+                                                  end_date=date(2023, 12, 26), coverage=SMALL_COVERAGE))
+            self.assertEqual(range_report["ticker_ranking"], [])
+            self.assertEqual(range_report["prepared_candidates"], {})
+            self.assertEqual(range_report["prepared_counts"], {"news_rows": 0, "price_rows": 0})
+            self.assertFalse(range_output.exists())
 
             boundary_output = root / "boundary-out"
-            boundary_report = prepare(root, boundary_output, start_date=date(2023, 12, 22), end_date=date(2023, 12, 22), coverage=SMALL_COVERAGE)
+            boundary_report = prepare(root, replace(config, output=boundary_output, start_date=date(2023, 12, 22),
+                                                     end_date=date(2023, 12, 22), coverage=SMALL_COVERAGE))
             self.assertEqual(boundary_report["counts"]["article_rows_outside_date_range"], 2)
-            boundary_events = parquet.read_table(boundary_output / "news_events.parquet", columns=["title"]).to_pylist()
-            self.assertEqual(len(boundary_events), 2)
+            boundary_events = parquet.read_table(candidate / "news.parquet", columns=["title"]).to_pylist()
+            self.assertEqual(boundary_report["prepared_counts"]["news_rows"], 2)
+            self.assertEqual(len(boundary_events), 1)
             self.assertEqual(boundary_events[0]["title"], "Good, news")
-            boundary_prices = parquet.read_table(boundary_output / "daily_prices.parquet").to_pylist()
+            boundary_prices = parquet.read_table(candidate / "prices.parquet").to_pylist()
             self.assertEqual({row["date"] for row in boundary_prices}, {date(2023, 12, 22), date(2023, 12, 26)})
 
     def test_config_file_and_cli_overrides(self):
@@ -221,6 +260,44 @@ class PreparationTests(unittest.TestCase):
             self.assertEqual(config.end_date, date(2021, 1, 1))
             self.assertEqual(config.coverage.covered_month_fraction, 0.9)
             self.assertEqual(config.coverage.max_empty_months, 0)
+            self.assertEqual(config.sentiment_coverage, SentimentCoverageThresholds())
+
+            with patch("sys.argv", ["prepare", "--root", str(root), "--config", str(config_path),
+                                    "--output", "custom", "--start-date", "2020-02-01"]):
+                parsed_root, parsed = parse_config_args("Fixture")
+            self.assertEqual(parsed_root, root.resolve())
+            self.assertEqual(parsed.output, root / "custom")
+            self.assertEqual(parsed.start_date, date(2020, 2, 1))
+
+    def test_candidate_write_failure_preserves_manifest_and_final_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            raw = root / "data/raw"
+            histories = raw / "full_history"
+            histories.mkdir(parents=True)
+            (histories / "ABC.csv").write_text(
+                "date,open,high,low,close,adj close,volume\n"
+                "2020-12-30,10,11,9,10,10,100\n"
+                "2020-12-31,10,11,9,10,10,100\n", encoding="utf-8",
+            )
+            (raw / "nasdaq_exteral_data.csv").write_text(
+                "Date,Article_title,Stock_symbol,Url,Publisher\n"
+                "2020-12-30 14:00:00 UTC,Headline,ABC,url,Publisher\n", encoding="utf-8",
+            )
+            preserved = [root / "data/interim/manifest.json", root / "out/news_events.parquet",
+                         root / "out/daily_prices.parquet", root / "reports/quality_report.json"]
+            for path in preserved:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"Previous successful run")
+            with (
+                patch("stock_market_sentiment.prepare.parquet.write_table", side_effect=OSError("Disk failure")),
+                self.assertRaisesRegex(OSError, "Disk failure"),
+            ):
+                prepare(root, PreparationConfig(date(2020, 12, 1), date(2020, 12, 31),
+                                                root / "out", SMALL_COVERAGE, 30))
+            for path in preserved:
+                self.assertEqual(path.read_bytes(), b"Previous successful run")
+            self.assertEqual(list((root / "data/interim").rglob("*.partial")), [])
 
     def test_year_end_links_missing_metadata_and_pre_history_rejection(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -243,33 +320,30 @@ class PreparationTests(unittest.TestCase):
                 writer.writerow(["2020-12-29 14:00:00 UTC", "Before prices", "NEW", "u2", "Test", ""])
                 writer.writerow(["2020-12-31 14:00:00 UTC", "Unmatched", "UNKNOWN", "u3", "Test", ""])
             output = root / "out"
-            report = prepare(root, output, start_date=date(2020, 12, 1), end_date=date(2020, 12, 31), coverage=SMALL_COVERAGE)
-            news = parquet.read_table(output / "news_events.parquet")
+            report = prepare(root, PreparationConfig(date(2020, 12, 1), date(2020, 12, 31),
+                                                     output, SMALL_COVERAGE, 30))
+            candidate = root / "data/interim/prepared/NEW"
+            news = parquet.read_table(candidate / "news.parquet")
             events = news.drop(["published_at_utc"]).to_pylist()
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0]["next_trading_date"], date(2021, 1, 4))
             self.assertFalse(events[0]["has_url"])
             self.assertFalse(events[0]["has_publisher"])
             self.assertEqual(report["candidate_tickers"], ["NEW"])
-            self.assertEqual(report["retained_tickers"], ["NEW"])
+            self.assertEqual(report["ticker_ranking"], ["NEW"])
             self.assertEqual(report["counts"]["article_rows_duplicate"], 1)
             self.assertEqual(report["counts"]["article_rows_missing_title"], 1)
             self.assertEqual(report["counts"]["article_rows_unusable_price_match"], 1)
             self.assertEqual(report["counts"]["article_rows_unmatched_ticker"], 1)
-            self.assertEqual(report["counts"]["price_rows_kept"], 3)
-            self.assertEqual(report["retained_news_quality"], {
-                "article_ticker_records": 1, "missing_publisher": 1,
-                "missing_publisher_fraction": 1, "missing_url": 1,
-            })
-            self.assertEqual(report["retained_news_by_year"], {2020: {
-                "article_ticker_records": 1, "tickers_with_articles": 1,
-            }})
+            self.assertEqual(report["prepared_counts"]["price_rows"], 3)
+            self.assertNotIn("retained_news_quality", report)
+            self.assertNotIn("retained_news_by_year", report)
             self.assertEqual(report["price_validation_by_ticker"]["NEW"]["price_rows_invalid"], 0)
-            prices = parquet.read_table(output / "daily_prices.parquet").to_pylist()
+            prices = parquet.read_table(candidate / "prices.parquet").to_pylist()
             self.assertEqual({row["ticker"] for row in prices}, {"NEW"})
             self.assertEqual([row["volume"] for row in prices], [100, 200, 300])
             self.assertEqual(report["article_filter_counts_by_ticker"]["NEW"]["matched_articles"], 4)
-            self.assertEqual(json.loads((root / "reports" / "quality_report.json").read_text())["retained_tickers"], ["NEW"])
+            self.assertEqual(json.loads((root / "data/interim/manifest.json").read_text())["ticker_ranking"], ["NEW"])
 
     def test_price_validation_accepts_integral_decimals_and_explains_rejections(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -328,14 +402,29 @@ class PreparationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             config_path = root / "config.json"
-            for name in ("max_tickers",):
-                for value in (0, -1, True, 1.5):
-                    with self.subTest(name=name, value=value):
-                        config_path.write_text(json.dumps({
-                            "start_date": "2015-01-01", "end_date": "2020-12-31", name: value,
-                        }), encoding="utf-8")
-                        with self.assertRaises(ValueError):
-                            load_config(config_path, root)
+            for value in (0, -1, True, 1.5):
+                with self.subTest(value=value):
+                    config_path.write_text(json.dumps({
+                        "start_date": "2015-01-01", "end_date": "2020-12-31", "max_tickers": value,
+                    }), encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        load_config(config_path, root)
+
+    def test_invalid_sentiment_coverage_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            for raw in (
+                {"articles_per_month": 0}, {"articles_per_month": True}, {"articles_per_month": 1.5},
+                {"covered_month_fraction": 0}, {"covered_month_fraction": 1.1},
+                {"covered_month_fraction": True}, {"unknown": 1},
+            ):
+                with self.subTest(raw=raw):
+                    config_path.write_text(json.dumps({
+                        "start_date": "2015-01-01", "end_date": "2020-12-31", "sentiment_coverage": raw,
+                    }), encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        load_config(config_path, root)
 
 
 if __name__ == "__main__":

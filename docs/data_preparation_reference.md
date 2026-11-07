@@ -2,7 +2,9 @@
 
 Reference notes for interpreting the project outputs and preparing a Phase 2 explanation. The sections below contain definitions, observed figures, implementation details and information still to be supplied by the team.
 
-**Snapshot:** November 4, 2026. Values are taken from the saved reports available on that date. A later preparation or scoring run can change them. This date is not a dataset download date.
+**Saved-results snapshot:** November 4, 2026. The figures and reconciliations below describe the saved reports from the earlier selection of 30 tickers before sentiment scoring. They do not describe an adaptive-selection run. This date is not a dataset download date. The reports remain evidence of their recorded run until the pipeline is run again.
+
+Sections 6 and 8 explain the current method: prepare all news-qualified candidates, then score candidates until enough pass numeric sentiment coverage. Current defaults require ten numeric ratings in at least 58 of the 72 publication months, with a target of 30 qualifying tickers. The sentiment figures below used an earlier ten-example prompt; the current method uses five examples. Snapshot performance is not evidence of the revised prompt or selection results.
 
 ## 1. Evidence locations and source information
 
@@ -13,7 +15,7 @@ Reference notes for interpreting the project outputs and preparing a Phase 2 exp
 | Preparation implementation | [prepare.py](../src/stock_market_sentiment/prepare.py) | Exact parsing, validation, deduplication, coverage, calculations and export behavior |
 | Preparation configuration | [default.json](../config/default.json) | Default period, maximum ticker count and coverage thresholds |
 | Sentiment implementation | [sentiment.py](../src/stock_market_sentiment/sentiment.py) | How model inputs are assembled and predictions become labels and scores |
-| Security identities | [securities.json](../config/securities.json) | Target names and stock/ETF types supplied to the model |
+| Security identities | [symbols_valid_meta.csv](../data/raw/symbols_valid_meta.csv) | Target names and stock/ETF types supplied to the model |
 
 The report values describe the completed run. Configuration and code explain the implementation; defaults alone do not prove which settings an earlier run used.
 
@@ -23,11 +25,14 @@ The report values describe the completed run. Configuration and code explain the
 | --- | --- | --- |
 | Prices | [data/raw/full_history/](../data/raw/full_history/); one CSV per ticker; ticker inferred from filename; daily date, OHLC, adjusted close and volume fields | Original dataset title, publisher/provider, source URL, actual download/export method and acquisition date if known |
 | News | [nasdaq_exteral_data.csv](../data/raw/nasdaq_exteral_data.csv); article metadata with publication timestamp, title, ticker, URL and publisher fields | Original dataset title, publisher/provider, source URL, actual download/export method and acquisition date if known |
+| Security catalog | `data/raw/symbols_valid_meta.csv`; required `Symbol`, `Security Name`, and `ETF` columns | Obtain the historical catalog from the [2020 Stock Market Dataset](https://www.kaggle.com/datasets/jacksoncrow/stock-market-dataset?select=symbols_valid_meta.csv); record its acquisition separately. This does not establish the provenance of the local price/news files. |
 | Sentiment model | Model identifier `Qwen/Qwen3.5-4B`; exact revision recorded in the sentiment report | Cite the model separately from the datasets if describing generated sentiment |
 
 The preparation code reads CSV files already present locally. It does not download the original price or news datasets. A filename containing “nasdaq” is insufficient evidence of the dataset's original provider or collection method. The code also does not establish upstream price adjustment methodology, currency or licensing; confirm those from the original source documentation where relevant.
 
 The news reader projects five source columns: `Date`, `Article_title`, `Stock_symbol`, `Url` and `Publisher`. Body text, summaries, author information and unrelated columns are not loaded into preparation outputs. Sentiment is generated locally from headlines; it is not an existing source label being cleaned.
+
+The catalog supplies readable security identities rather than market observations. Its ETF flag is `Y` for an ETF and `N` otherwise, following [Nasdaq's field definitions](https://www.nasdaqtrader.com/Trader.aspx?id=SymbolDirDefs). A 2020 snapshot is useful for this study period but is not a full historical entity master. Acquisitions, company renaming and symbol reuse are not resolved automatically.
 
 ## 2. Units of observation and count scopes
 
@@ -36,9 +41,10 @@ The news reader projects five source columns: `Date`, `Article_title`, `Stock_sy
 | Price row | One observed daily price record for one ticker. The cleaned price table has one row per ticker/date. |
 | Article–ticker record | One news record associated with one ticker. The same underlying article can contribute records for several tickers. |
 | Candidate ticker | A normalized ticker identified by a price CSV filename. This defines which news tickers can enter preparation. |
-| Qualified ticker | A candidate that passes every news-coverage threshold after date filtering, usable price matching and deduplication. |
-| Retained ticker | A qualified ticker selected by the ranking and maximum-ticker limit. |
-| Model inference | One classification of a ticker/headline pair within a processing chunk. Repeated pairs in that chunk reuse the result. |
+| News-qualified ticker | A candidate that passes every initial news-coverage threshold after date filtering, usable price matching and deduplication. In the preparation report, `qualified_tickers` refers to this screen. |
+| Sentiment-qualified ticker | A scored candidate meeting the configured monthly numeric-rating depth across the full publication window. |
+| Retained ticker | One of the first sentiment-qualified candidates in ranking order, up to the final ticker target. The historical snapshot selected tickers before scoring instead. |
+| Model inference | One classification of a distinct ticker/headline pair within a candidate history. Repeated titles for that ticker share the prediction while retaining their article rows. The historical snapshot reused predictions only within input chunks. |
 
 **Article–ticker counts are not counts of globally unique articles.** Likewise, unique ticker/headline pairs are not necessarily unique articles: different URLs can share a title.
 
@@ -50,7 +56,9 @@ There are three particularly important scopes:
 
 Counters from different scopes should not be treated as if they described the same population.
 
-## 3. Snapshot of the completed run
+The adaptive workflow adds a fourth scope: **evaluated sentiment candidates**, including scored tickers that fail the final coverage test. Their model work and labels must not be confused with the rows exported for retained tickers. Prepared but unvisited candidates have no sentiment evaluation merely because they appear in the manifest.
+
+## 3. Snapshot of the completed pre-scoring-selection run
 
 | Measure | Value | Scope or interpretation |
 | --- | ---: | --- |
@@ -75,7 +83,7 @@ The retained symbols include stocks and ETFs; “30 tickers” should not be des
 
 ### 4.1 Price counters: `counts.price_*`
 
-These counters cover the **initial validation pass over full histories of all 7,693 candidates**, except `price_rows_kept`, which describes the final export. Selected histories are read again for export using separate scratch counters, so that reread does not double the reported input totals.
+These snapshot counters cover the **initial validation pass over full histories of all 7,693 candidates**, except `price_rows_kept`, which describes the final export. That run reread selected histories using separate scratch counters. The current preparation stage validates each history once and stages eligible prices for later export.
 
 | Counter | Snapshot | Definition |
 | --- | ---: | --- |
@@ -155,6 +163,8 @@ Missing-publisher and missing-URL flags are overlapping descriptions of records.
 
 ## 5. Other preparation report fields
 
+The tables in this section interpret the saved snapshot. The candidate manifest uses the same initial validation and news-coverage definitions; final counts and retained-ticker summaries describe completed selection only when the scoring stage publishes the reports. A prepared candidate is not automatically a final retained ticker.
+
 ### 5.1 Ticker lists, selection settings and study dates
 
 | Field | Meaning |
@@ -164,9 +174,9 @@ Missing-publisher and missing-URL flags are overlapping descriptions of records.
 | `retained_tickers` | Final selected ticker list used for the news output; same universe as `price_tickers`. |
 | `rejected_tickers` | Candidates failing at least one coverage criterion. Passing candidates outside the cap are not in this list. |
 | `qualified_tickers` | All passing candidates, listed alphabetically. |
-| `qualified_but_not_selected` | Passing candidates excluded by the final ticker cap. |
+| `qualified_but_not_selected` | News-qualified candidates outside the final retained set. In the snapshot this was solely the initial cap; adaptive selection can also reject evaluated candidates for insufficient numeric sentiment coverage or stop before visiting them. |
 | `ticker_ranking` | Passing candidates in actual selection order. |
-| `selection.max_tickers` | Maximum selected ticker count: 30 in this run. |
+| `selection.max_tickers` | Maximum final selected ticker count: 30 by default. |
 | `selection.ranking_rule` | Covered months descending, then distinct publication dates descending, then ticker alphabetically. Raw article volume and sentiment do not determine this ranking. |
 | `selection.article_identity` | Per-ticker duplicate key: exact stripped URL, otherwise publication timestamp and stripped title. |
 | `selection.coverage_window` | Coverage is measured across every configured month, including leading and trailing gaps. |
@@ -192,7 +202,7 @@ Coverage is evaluated separately for each candidate after date filtering, usable
 | `distinct_publication_dates` | 60 | At least 60 distinct UTC publication dates; these are calendar dates, not necessarily trading sessions. | Reduce dependence on a small number of heavily reported days. |
 | `articles` | 100 | At least 100 surviving article–ticker records over the whole window. | Require a minimum total volume of observations. |
 
-These are project design choices, not statistically established guarantees of representativeness or model accuracy. There is **no minimum article count per covered month**: one article makes a month “covered.” All passing candidates are ranked, and at most 30 are retained for a manageable visualization dataset.
+These are project design choices, not statistically established guarantees of representativeness or model accuracy. There is **no minimum article count per covered month in the initial screen**: one article makes a news month “covered.” All passing candidates are ranked and prepared. Final selection additionally requires the numeric sentiment depth described in section 6; `max_tickers` limits the final universe rather than the candidate pool.
 
 ### 5.3 `coverage_by_ticker`
 
@@ -255,9 +265,36 @@ Snapshot annual totals are 18,334 (2015), 22,848 (2016), 25,969 (2017), 28,053 (
 2. Stream selected news columns; normalize ticker/text, parse UTC timestamps, match candidate symbols and restrict publication dates.
 3. Validate each candidate's full price history, deduplicate dates, sort sessions and calculate price features.
 4. For each candidate, find a usable subsequent price session for each article, then deduplicate its articles.
-5. Measure news coverage, identify qualifiers, rank them and retain at most 30.
-6. Export selected news and prices with explicit types; write the preparation report.
-7. Separately score headlines for their target securities and enrich the news file; write the sentiment report.
+5. Measure initial news coverage and rank all passing candidates by covered months, distinct publication dates, then ticker. Write typed news and price files under `data/interim/prepared/<ticker>/` and an inventory at `data/interim/manifest.json`. The manifest contains preparation counts; final counts and retained-ticker summaries are produced after sentiment selection.
+6. Visit candidates in that order. Resolve each target's name/type and reuse a matching scoring checkpoint or classify the ticker's full prepared news history. Load the model once when new inference is needed.
+7. Count numeric ratings by UTC publication month, including zero-count months across the whole configured window. Retain a candidate only if enough months meet the depth threshold.
+8. Stop at the target number of qualifiers or after exhausting candidates. Publish the final matching-universe news and price outputs and reports after selection. Keep null-scored articles for retained tickers.
+
+The two commands are:
+
+```powershell
+.\.venv\Scripts\python.exe -m stock_market_sentiment
+.\.venv\Scripts\python.exe -m stock_market_sentiment.sentiment
+```
+
+Both use the shared configuration and accept `--root`, `--config`, `--output`, `--start-date` and `--end-date`. Supply matching preparation settings to both. Changes to raw data, study dates or initial cleaning rules require preparation again. A prompt change requires scoring again; changing only final selection thresholds can reuse completed scores.
+
+### Final sentiment coverage and stopping rule
+
+| Setting or measure | Definition |
+| --- | --- |
+| `max_tickers` | Desired maximum final ticker count, 30 by default; there is no equivalent 30-candidate inference limit. |
+| `sentiment_coverage.articles_per_month` | Minimum numeric article–ticker ratings for one publication month to meet depth, 10 by default. |
+| `sentiment_coverage.covered_month_fraction` | Required fraction of all configured publication months meeting that depth, 0.8 by default. |
+| Numeric rating | Negative (−1), neutral (0), or positive (+1). Mixed and insufficient information are null and do not count toward this screen. |
+| Required months | Round the month-count requirement up: `ceil(72 × 0.8) = 58` by default. A month with no numeric ratings is included in the denominator. |
+| Final order | Retain the first qualifying candidates in the predetermined news-coverage ranking, rather than finding the strongest possible 30 across every candidate. |
+
+If the pool is exhausted with fewer than 30 qualifiers, export that smaller qualifying set and report the shortfall. If none qualify, raise an error and preserve the existing final outputs. Do not relax criteria automatically to reach 30.
+
+Per-ticker checkpoints preserve completed predictions, including those for rejected candidates. Input-content and model/prompt/identity fingerprints prevent incompatible scores from being reused. Coverage thresholds are applied to scores rather than changing those predictions, so threshold changes alone do not require inference again. An interruption or missing identity can be resolved and the scoring command rerun; completed compatible ticker checkpoints are reused.
+
+Coverage selection is based on observation counts and temporal spread, not average sentiment or subsequent returns. Passing it improves practical chart depth but does not establish classification accuracy or eliminate selection bias.
 
 ### Transformations and why they are used
 
@@ -269,7 +306,7 @@ Snapshot annual totals are 18,334 (2015), 22,848 (2016), 25,969 (2017), 28,053 (
 | Publication-window restriction | Keep dates from 2015-01-01 through 2020-12-31 inclusive. | Bound the study period and keep graph comparisons within a consistent window. This alone does not prove uniformly high source quality. |
 | Price validation | Reject unparsable, nonfinite, nonpositive-price, invalid-volume and inconsistent-OHLC rows; keep first valid row per date. | Prevent malformed records from entering metrics and session matching. Invalid price values are removed rather than imputed. |
 | News duplicate removal | Within one ticker, keep the first usable record for a stripped URL; when URL is empty, use publication timestamp plus title. | Limit repeated source records. Article-ticker associations for different tickers remain distinct. Headline-only duplicates with different URLs can remain. |
-| Coverage and ranking | Apply all five coverage criteria, then rank qualifiers and cap the result at 30. | Favor continuity and reduce dataset size. The sample is selected for coverage, not representative market sampling. |
+| Coverage and ranking | Apply the initial news criteria, rank all qualifiers, then visit scored candidates until at most 30 meet monthly numeric-rating coverage. | Favor continuity and usable chart depth. The sample is selected for coverage, not representative market sampling. |
 | Optional metadata handling | Retain empty publishers/URLs when other requirements pass; export presence flags. | Preserve usable headline observations while making missing metadata visible. No publisher is inferred or filled from another source. |
 | Body exclusion | Do not load or export body/summary text. | Keep the preparation and model input focused on headlines and reduce storage/context requirements. The sentiment model cannot use omitted article context. |
 | Typed Parquet output | Persist dates, timestamps, numbers and booleans using explicit Arrow schemas. | Preserve field types for Power BI and avoid repeatedly parsing strings on import. |
@@ -352,23 +389,56 @@ The model's `target_name` and `security_type` are lookup inputs recorded in mode
 
 ## 8. Sentiment methodology and report definitions
 
-### Classification method
+### Current classification method
 
-The scorer loads the pinned text model `Qwen/Qwen3.5-4B`, revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`. Each input contains `target_ticker`, `target_name`, `security_type` and `headline`. Names and types come from the security lookup; every input ticker must have a nonempty identity entry before model loading proceeds.
+The scorer loads the pinned text model `Qwen/Qwen3.5-4B`, revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`. Each input contains `target_ticker`, `target_name`, `security_type` and `headline`. Names and types come from the historical symbol catalog. A missing candidate identity stops selection; correct the catalog and resume to reuse completed compatible scoring checkpoints.
 
-The prompt asks for evidence about the target before assigning sentiment. Ten fixed-order user/assistant examples use the same JSON input format. Thinking is disabled. The implementation chooses the highest next-token model logit among the five answer letters A–E; it does not generate or export explanations or confidence values. The exact prompt, examples and identities used are recorded in the sentiment report and Parquet metadata.
+The prompt resolves whether the headline applies to the target before assigning direction. Five fixed-order user/assistant examples use the same JSON input format. Thinking is disabled. The implementation chooses the highest next-token model logit among the five answer letters A–E; it does not generate or export explanations or confidence values. The completed run records its model and prompt provenance; per-candidate checkpoints also record the identity and input fingerprints needed to decide whether scores can be reused.
+
+There is one association-based exception to directly identified target evidence: a uniformly bullish or bearish investment recommendation about unnamed securities can apply to the associated target when the group's stock/ETF type matches. For example, an unnamed list of stocks to buy can provide positive sentiment for an associated stock. This assumes the target belongs to the recommended group; source ticker tags do not establish that membership. The model still receives headlines rather than article bodies.
+
+Headlines concerning only another company, an unnamed sector or a commodity remain UNKNOWN. Fund flows concern the named fund and do not transfer to its holdings; stock picks do not automatically recommend an ETF. Unresolved buy/avoid groups and comparisons remain UNKNOWN. Named trading-activity lists, schedules and previews can be NEUTRAL. MIXED requires explicit material favorable and adverse facts about the same target, with neither dominant. Unchanged guidance, ratings or dividends are nondirectional; hedging or a question does not itself supply an opposing fact.
 
 | Answer | Saved label | Score | Intended meaning |
 | --- | --- | ---: | --- |
 | A | `negative` | −1 | Material adverse implications for the target. |
 | B | `neutral` | 0 | A concrete target-specific fact with no directional implication. |
 | C | `positive` | +1 | Material favorable implications for the target. |
-| D | `mixed` | null | Material favorable and adverse implications for the same target, neither dominant. |
-| E | `insufficient_information` | null | The headline does not assert enough target-specific information. |
+| D | `mixed` | null | Explicit material favorable and adverse facts for the same target, neither dominant. |
+| E | `insufficient_information` | null | No applicable assertion under the attribution rules, or a directionless teaser. |
 
 Mixed and insufficient information remain separate labels even though both have null scores. A neutral zero means a classified nondirectional fact; a null does not mean neutral. The label definitions express the intended task, not a guarantee that each model prediction satisfies it.
 
-### Sentiment report fields
+### Current adaptive report fields
+
+The current [sentiment report](../reports/sentiment_report.json) separates candidates visited during selection from final exported records. These definitions apply after an adaptive run; the saved snapshot below uses the earlier report structure.
+
+| Field | Meaning |
+| --- | --- |
+| `input_manifest` | Preparation inventory used for this selection. |
+| `target_tickers`, `retained_tickers` | Requested final count and the tickers accepted in candidate order. |
+| `evaluated_tickers` | Candidates whose complete scores were examined, including reused checkpoints and rejected candidates. |
+| `rejected_tickers` | Evaluated candidates failing the numeric-coverage screen. In the quality report, the top-level field still means initial news-coverage failures; sentiment failures appear under `sentiment_selection`. |
+| `unprocessed_tickers` | Ranked candidates not visited because the target was reached. They can have checkpoints from previous runs. |
+| `target_reached`, `stop_reason` | Whether the requested count qualified; stopping is `target_reached` or `candidate_pool_exhausted`. |
+| `candidate_counts.tickers`, `.article_rows`, `.numeric_score_rows` | Totals for evaluated candidates, including those later rejected. |
+| `candidate_counts.headline_inferences` | Distinct ticker/headline predictions represented by those candidates, including cached predictions. |
+| `candidate_counts.tickers_scored_this_run`, `.tickers_reused_this_run` | Candidates requiring new inference versus compatible completed checkpoints. |
+| `candidate_counts.article_rows_scored_this_run`, `.new_headline_inferences` | Rows enriched and distinct headlines actually classified during this execution. |
+| `final_counts` | Ticker, article, price and numeric-score counts in the two final outputs. |
+| `label_counts`, `mean_sentiment_score` | Final selected records only; null scores are excluded from the mean. |
+| `coverage_by_ticker` | Per-evaluated-ticker numeric/directional counts, monthly counts, depth fractions and pass/failure. Directional means negative or positive; neutral still counts as numeric. |
+| `inference_seconds`, `records_per_second` | Time inside new table scoring, excluding model loading and checkpoint writes, and new enriched rows divided by that time. Cached-only runs have no throughput value. These are not GPU-only benchmarks. |
+| `prepared_counts` in the quality report | News and price rows staged for every initial news-coverage qualifier, including unvisited candidates. |
+| `selection.sentiment_coverage` in the quality report | Final numeric-rating depth settings, separate from initial news `coverage_thresholds`. |
+
+The news Parquet footer stores the report's inference recipe as JSON under `sentiment_provenance`. Candidate checkpoints additionally store input and recipe fingerprints for safe reuse.
+
+Numeric coverage counts article–ticker records after preparation deduplication. Repeated titles with distinct article identities still count, although their inference is reused. Counts are not a guarantee of independent information. Every configured publication month is represented in `numeric_scores_by_month`, including zero months. `minimum_monthly_scores`, `median_monthly_scores` and `max_empty_months` describe depth and gaps; only the configured per-month depth and sufficient-month fraction determine the final pass.
+
+### Saved run and sentiment report fields
+
+The saved November 4 results below used the previous prompt with ten examples and a stricter treatment of unnamed recommendations. Their label distribution, mean, timings and settings remain evidence of that completed run; they are not results for the current five-example prompt. The saved report and Parquet metadata identify the instructions actually used. A subsequent sentiment run replaces those results and provenance.
 
 | Field | Snapshot or interpretation |
 | --- | --- |
@@ -393,7 +463,7 @@ Mixed and insufficient information remain separate labels even though both have 
 | `records_per_second` | 8.6 records/second over processing after initial model loading; includes processing overhead, not just GPU execution. |
 | `elapsed_seconds` | 16,639.08 seconds for the reported scoring run, including initial model loading. Timing fields are operational statistics, not quality metrics. |
 
-Within a chunk, repeated `(ticker, title)` pairs share an inference while retaining their separate rows. The same headline attached to different tickers is classified separately. This reuse is distinct from preparation's URL-based duplicate removal: the stages use different keys and operate on different populations.
+The snapshot reused repeated `(ticker, title)` pairs within each chunk. The current scorer reuses each distinct title across the complete candidate ticker history, including titles separated by input chunks. The same headline attached to different tickers is classified separately. This inference reuse is distinct from preparation's URL-based duplicate removal: the stages use different keys and retain different populations.
 
 ### Label totals and mean calculation
 
@@ -416,22 +486,23 @@ Mean sentiment = (20,501 − 6,334) / 39,352 = 0.360007...
 
 Numeric ratings cover about 27.7% of all retained records. The mean is a summary of assigned categories, not predicted return, percentage price change, probability or certainty. It is weighted by retained article–ticker records, so repeated titles or multiple stories can affect averages. It does not average all 142,266 records with nulls replaced by zero.
 
-Preparation replaces the base news output; sentiment scoring subsequently enriches that file in place. The preparation report therefore describes the base preparation stage, while the sentiment report describes the later generated fields.
+The current workflow prepares separate candidate files and publishes the two final tables only after scoring and selection. The quality report documents cleaning and the final universe; the sentiment report distinguishes evaluated candidate coverage from final exported label counts. Reused checkpoints avoid inference but still contribute predictions to the current selection. Do not interpret a resumed run's newly executed inference count or wall-clock time as the cost of scoring all exported rows from scratch.
 
 ## 9. Findings and limitations relevant to interpretation
 
 | Evidence or design choice | Implication |
 | --- | --- |
 | 89,852 of 142,266 retained records lack a publisher: 63.16%. | Publisher comparisons use an incomplete subset. All retained rows have URLs in this run, but URL presence does not prove that the linked page is still accessible. |
-| 30 retained tickers are chosen from 1,493 qualifiers using coverage over the entire window. | Conclusions describe this coverage-selected sample. It is not a random market sample or a universe selected independently at each historical date. |
+| The snapshot retained 30 of 1,493 news qualifiers. Current selection additionally screens scored candidates across the entire window. | Conclusions describe a coverage-selected sample. It is not a random market sample or a universe selected independently at each historical date. |
 | The retained universe includes ETFs as well as stocks. | A fund headline and a constituent-company headline can require different target attribution. A headline about fund flows does not automatically describe each holding. |
-| Coverage tests precede sentiment scoring. | News presence in a month does not guarantee enough non-null sentiment observations for a stable monthly average. |
-| Headlines are associated with tickers by the source dataset; there is no body-level entity verification. | A valid article association can still provide no target-specific evidence in the headline. UNKNOWN is an intended outcome. |
+| Initial news coverage precedes scoring; final selection requires numeric-rating depth across publication months. | News presence alone is insufficient. Even passing ten ratings in 80% of months permits thinner months and does not guarantee daily coverage or statistically stable averages. |
+| Headlines are associated with tickers by the source dataset; there is no body-level entity verification. | A valid article association can still provide no target-specific evidence in the headline. The current method assumes recommendation membership for uniformly directional unnamed lists of the matching stock/ETF type; incidental mentions can make that assumption wrong. UNKNOWN remains appropriate when no assertion applies. |
 | Sentiment is model-generated from the headline and target identity only. | Missing context, target attribution, neutral/unknown boundaries and MIXED judgments can cause errors. Label frequencies alone do not establish accuracy. |
 | Prices are daily observations and links use UTC dates plus subsequent observed sessions. | The data does not measure precise intraday reactions or prove which trading session first incorporated the news. |
 | Other events and market conditions are not controlled experimentally. | News, sentiment, volume and returns can be compared as associations; causation is not established. |
 | Checks occur at specific processing stages. | Missing-value and rejection counts must be reported with their scope. The report is not an exhaustive missingness/type/label audit of every raw column. |
 | Text cleanup strips whitespace and normalizes ticker case. | This is not comprehensive publisher-name standardization, historical security-identity resolution, or duplicate detection across URL variants. |
+| A historical name/type catalog identifies the target. | A snapshot is not a full history of corporate identities. Wrong historical mappings can affect attribution even when numeric coverage is strong. |
 
 Useful quality evidence includes invalid-row reasons and examples, explicit duplicate rules, exact filtering counts, typed output definitions and temporal coverage summaries. “Cleaned” here means processed under these rules; it does not certify the original source's completeness or every generated label's correctness.
 
